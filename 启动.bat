@@ -30,9 +30,15 @@ del "%HERE%data\.write_test" >nul 2>nul
 echo   数据目录可读写 OK
 echo.
 
-rem ── 3. 找 Node.js ──
-where node >nul 2>nul
-if errorlevel 1 (
+rem ── 3. 找 Node.js：优先用随包自带的运行时 ──
+set "NODE_EXE="
+if exist "%HERE%runtime\node\node.exe" set "NODE_EXE=%HERE%runtime\node\node.exe"
+if not defined NODE_EXE if exist "%HERE%node\node.exe" set "NODE_EXE=%HERE%node\node.exe"
+if not defined NODE_EXE (
+  where node >nul 2>nul
+  if not errorlevel 1 set "NODE_EXE=node"
+)
+if not defined NODE_EXE (
   echo   x 没有找到 Node.js，无法启动。
   echo.
   echo     解决办法：
@@ -48,6 +54,6 @@ if errorlevel 1 (
 echo   正在启动……浏览器会自动打开
 echo   用完在本窗口按 Ctrl + C 关闭服务
 echo.
-node server.js
+"%NODE_EXE%" server.js
 echo.
 pause
