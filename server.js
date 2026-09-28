@@ -458,13 +458,13 @@ function studentKey(className, name) {
   return normKey(className) + '|' + n;
 }
 
-/* 从上传文件名里取姓名：老师一般把答题卡按「编号_姓名.jpg」命名（如 01_蔡子成.jpg）。
+/* 从上传文件名里取姓名：老师一般把答题卡按「编号_姓名.jpg」命名（如 01_李小明.jpg）。
    这是教师自己排好的名单，比让模型去认卷面上旋转的小字可靠，所以拿它当姓名的兜底。
    只认「文件名结尾是 2–4 个汉字」的情况，其它命名（IMG_1234.jpg、扫描件001.jpg）一律忽略。 */
 const NOT_A_NAME = /答题卡|扫描|扫描件|试卷|作文|原卷|原件|副本|学生|练习|模拟|英语|答案/;
 function nameFromFileName(name) {
   const base = String(name || '').replace(/\.[A-Za-z0-9]+$/, '').trim();
-  // 前缀只允许「字母数字 + 分隔符」或什么都不写，避免把「蔡子成」这种纯姓名截成「子成」
+  // 前缀只允许「字母数字 + 分隔符」或什么都不写，避免把「李小明」这种纯姓名截成「小明」
   const m = base.match(/^(?:[0-9A-Za-z]+[_\-\s]*)?([\u4e00-\u9fa5]{2,4})$/);
   if (!m) return '';
   const cand = m[1];
