@@ -79,6 +79,39 @@ textarea{resize:vertical;min-height:74px;line-height:1.65}
 .btn.dark:hover{background:#1E293B}
 .btn.sm{font-size:13px;padding:7px 13px}
 .btn-row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.prow{display:flex;gap:8px;align-items:center;margin-bottom:8px}
+.prow input{flex:1}
+.prow .del{flex:none;width:60px;padding:6px 0}
+.clsbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:4px 0 12px;padding:9px 12px;
+  background:#F8FAFD;border:1px solid var(--line);border-radius:10px;font-size:13px;color:var(--ink2)}
+.clsbar b{font-weight:700;color:var(--ink)}
+.clsbar input{flex:0 0 150px;padding:6px 9px}
+
+/* 班级整体情况分析 */
+.ana-h{display:flex;align-items:center;gap:8px;margin:22px 0 6px;font-size:14px;font-weight:750}
+.ana-h .dot{margin-right:2px}
+.ana-h .sub{margin-left:auto;font-size:12px;font-weight:500;color:var(--ink3)}
+.ana-blk{margin-top:14px}
+.ana-dims{margin-top:12px}
+.tags{display:flex;gap:8px;flex-wrap:wrap;margin-top:4px}
+.tag{border:1px solid var(--line);background:#F8FAFD;border-radius:999px;padding:4px 12px;font-size:12.5px;color:var(--ink2)}
+.tag b{color:var(--ink);font-weight:700}
+.tag span{color:var(--ink3);margin-left:6px}
+
+/* 学生档案里点开某一篇的详情弹层 */
+.ovl{position:fixed;inset:0;background:rgba(15,23,42,.55);backdrop-filter:blur(3px);z-index:110;display:none;align-items:center;justify-content:center;padding:26px}
+.ovl.on{display:flex}
+.ovl .box{background:#fff;border-radius:16px;max-width:880px;width:100%;max-height:90vh;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 30px 70px -20px rgba(15,23,42,.5)}
+.ovl .bar{padding:12px 18px;display:flex;justify-content:space-between;align-items:center;border-top:1px solid var(--line);font-size:13px;color:var(--ink2)}
+.recwrap{padding:20px 22px;overflow:auto}
+.recwrap .dims{margin-top:14px}
+.rec-h .t{font-size:16px;font-weight:750;letter-spacing:-.2px}
+.rec-h .s{font-size:12.5px;color:var(--ink3);margin-top:3px}
+.rec-score{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-top:12px;padding:12px 14px;background:#F8FAFD;border:1px solid var(--line);border-radius:11px}
+.rec-score b{font-size:30px;font-weight:800;letter-spacing:-1px;color:var(--blue);line-height:1}
+.rec-score i{font-style:normal;font-size:13px;font-weight:600;color:var(--ink3)}
+.rec-meta{font-size:12.5px;color:var(--ink3);margin-left:auto}
+#recModal .rec-img{max-width:100%;max-height:300px;width:auto;display:block;border:1px solid var(--line);border-radius:10px;cursor:zoom-in}
 
 /* drop zone */
 .drop{
@@ -117,6 +150,7 @@ textarea{resize:vertical;min-height:74px;line-height:1.65}
 .bg-done{background:#ECFDF5;color:var(--t1)} .bg-err{background:#FEF2F2;color:var(--t5)}
 .bg-run{background:#EFF4FF;color:var(--t2)} .bg-pend{background:#F1F5FB;color:var(--ink3)}
 .bg-rev{background:#FFF7ED;color:#C2410C}
+.bg-warn{background:#FFFBEB;color:#B45309}
 
 .essay .body{border-top:1px solid var(--line);padding:18px;display:none;background:#FCFDFF}
 .essay.open .body{display:block}
@@ -136,6 +170,11 @@ textarea{resize:vertical;min-height:74px;line-height:1.65}
 /* 要点核对清单：不用默认圆点，改用 ✓ / ✗ */
 .blk.points li{padding-left:2px;display:flex;gap:8px}
 .blk.points li::before{display:none}
+.blk .wrong{color:#B91C1C;font-weight:650}
+.blk .right{color:#047857;font-weight:650}
+.blk .arw{color:var(--ink3);margin:0 2px}
+.blk .et{display:inline-block;margin-left:8px;font-size:11px;font-weight:600;color:var(--ink2);background:#F1F5FB;border-radius:5px;padding:1px 7px;vertical-align:1px}
+.blk .en{color:var(--ink3);font-size:12.5px;margin-top:2px}
 .blk.points li .mk{flex:none;font-weight:800;width:14px}
 .blk.points li .mk.y{color:var(--t1)}
 .blk.points li .mk.n{color:var(--t5)}

@@ -42,6 +42,9 @@
           <button class="btn" id="btnNewBatch">＋ 新建批次</button>
         </div>
         <div style="flex:0 0 auto;min-width:0">
+          <button class="btn ghost" id="btnEditBatch">编辑批次</button>
+        </div>
+        <div style="flex:0 0 auto;min-width:0">
           <button class="btn ghost" id="btnDelBatch">删除批次</button>
         </div>
       </div>
@@ -49,7 +52,7 @@
     </div>
 
     <div class="card" id="newBatchCard" style="display:none">
-      <div class="card-h"><span class="dot o">新</span>新建批改批次<span class="sub">题目与要点越准确，漏点判定越准</span></div>
+      <div class="card-h"><span class="dot o" id="nbDot">新</span><span id="nbCardTitle">新建批改批次</span><span class="sub" id="nbCardSub">题目与要点越准确，漏点判定越准</span></div>
 
       <div class="field">
         <label class="lb">拍照识别题目 <small>选填，拍试卷上的作文题即可自动填写下面几项</small></label>
@@ -73,15 +76,15 @@
         <input type="text" id="nbTitle" placeholder="输入本次作文题">
       </div>
       <div class="field">
-        <label class="lb">班级 <small>仅用于你内部核对，导出文件不含姓名</small></label>
-        <input type="text" id="nbClass" placeholder="如 九二班">
+        <label class="lb">批次默认班级 <small>只当默认值，每篇以卷面识别或手填为准</small></label>
+        <input type="text" id="nbClass" placeholder="如 九二班" list="clsOptions">
+        <div class="hint">一个批次里混了几个班的卷子也没关系：每篇按卷面上写的班级记，这里只是「一键填写班级」时的默认值。</div>
       </div>
       <div class="field">
-        <label class="lb">本题核心要点 <small>每题 3 个，逐条填写</small></label>
-        <input type="text" id="nbP1" placeholder="要点 1" style="margin-bottom:8px">
-        <input type="text" id="nbP2" placeholder="要点 2" style="margin-bottom:8px">
-        <input type="text" id="nbP3" placeholder="要点 3">
-        <div class="hint">缺 1 个要点按中考标准直接降一档，所以要点必须填准。可只填 2 条或留空；用上面的拍照识别可自动填入。</div>
+        <label class="lb">本题核心要点 <small>数量不固定，有几条填几条</small></label>
+        <div id="nbPoints"></div>
+        <button class="btn sm ghost" id="btnAddPoint" type="button">＋ 加一条要点</button>
+        <div class="hint">缺 1 个要点按中考标准直接降一档，所以要点必须填准。数量不固定（常见 2–5 条），拍照识别会自动按实际数量填入，也可手动增删。</div>
       </div>
       <div class="btn-row">
         <button class="btn orange" id="btnCreateBatch">创建批次</button>
@@ -129,11 +132,20 @@
       <div class="card-h"><span class="dot">▦</span>本次统计<span class="sub" id="statSub"></span></div>
       <div class="stats" id="stats"></div>
       <div class="dist" id="dist"></div>
+      <div id="analysis"></div>
+      <div id="classAi"></div>
     </div>
     <div class="card" id="rosterCard" style="display:none">
       <div class="card-h"><span class="dot">▤</span>登分表<span class="sp"></span>
         <button class="btn sm" id="btnCopyRoster">复制登分表</button>
         <button class="btn sm dark" id="btnRoster">导出登分表（含姓名）</button>
+      </div>
+      <div class="clsbar">
+        <b>一键填写班级</b>
+        <input type="text" id="clsFillInput" list="clsOptions" placeholder="如 九二班">
+        <button class="btn sm" id="btnFillClassBlank">只填空白的</button>
+        <button class="btn sm ghost" id="btnFillClassAll">全部改成这个</button>
+        <span class="hint" id="clsFillHint"></span>
       </div>
       <div class="tbl-wrap"><table id="rosterTable"></table></div>
       <div class="note"><b>姓名、班级、考号可以直接在这张表里点一下就能改</b>，改完点别处自动保存，按回车跳到下一行继续填，一路填下来很快。<br>姓名优先取你在表里填的，其次取卷面识别到的。「正文首句」用来快速辨认是哪一篇作文。<br><b>这份表含学生姓名，仅供你内部登分使用</b>，导出文件名已标注「仅内部使用」，请勿转发或上传。</div>
@@ -146,7 +158,7 @@
       </div>
       <div class="tbl-wrap"><table id="scoreTable"></table></div>
       <div class="tip">「导出学生报告」生成 Word 文档，<b>每个学生一页</b>，含得分、要点核对、改进建议、老师评语和为该生改写的范文，可直接打印裁开发到学生手上。<b>识别到或手填了姓名的会自动印上姓名，没有的留空供手写。</b></div>
-      <div class="tip">成绩表和学生报告都会带上姓名 —— 卷面识别到的、或你在登分表里手填的。没有姓名则留空。<b>这两份文件含学生个人信息，请勿转发或上传到外部平台</b>，发给学生本人没问题。</div>
+      <div class="tip">成绩表和学生报告都会带上姓名 —— 卷面识别到的、或你在登分表里手填的。没有姓名则留空（报告上留一条空白下划线给你手写）。<b>这些文件含学生个人信息，请勿转发或上传到外部平台</b>，发给学生本人没问题。</div>
     </div>
   </section>
 
@@ -242,7 +254,9 @@
         <li style="padding:6px 0">· API Key 保存在本机 <code>data/settings.json</code>，不会写入其他任何地方。</li>
         <li style="padding:6px 0">· 只有点击「开始批改」时，才把当篇作文照片发送给你配置的 AI 服务商，其余时间不联网。</li>
         <li style="padding:6px 0">· 服务只监听本机 127.0.0.1，同一局域网的其他设备也无法访问。</li>
-        <li style="padding:6px 0">· 对外输出的成绩表只用编号，不写学生姓名。</li>
+        <li style="padding:6px 0">· 写盘用「原子替换」：先写临时文件再改名，中途断电或强退不会把记录写坏。</li>
+        <li style="padding:6px 0">· 每次启动、每次删批次前自动留一份快照在 <code>data/backup/</code>（最多 10 份）；万一文件损坏，启动时自动回退最近快照并提示你。</li>
+        <li style="padding:6px 0">· <b>导出的成绩表、登分表、学生报告、成绩归档表都会带上姓名</b>（卷面识别到或你在登分表里填的；没识别到就留空）。这些文件含学生个人信息，<b>仅供你内部使用或发给学生本人</b>，请勿转发、上传到外部平台。</li>
       </ul>
       <div class="note">建议：上传前用手机相册的涂鸦功能遮掉学生姓名，或让学生只写考号，从源头避免个人信息外流。</div>
     </div>
@@ -255,6 +269,19 @@
     编制：Teacher_Tony　·　数据全部保存在本机，请勿将含学生个人信息的材料上传至外部平台
   </div>
 </footer>
+
+<datalist id="clsOptions"></datalist>
+
+<!-- 学生档案：点开某一篇看完整批改信息 -->
+<div class="ovl" id="recModal">
+  <div class="box">
+    <div class="recwrap" id="recBody"></div>
+    <div class="bar">
+      <span id="recCap"></span>
+      <button class="btn sm ghost" id="recClose">关闭</button>
+    </div>
+  </div>
+</div>
 
 <div class="modal" id="modal">
   <div class="box">

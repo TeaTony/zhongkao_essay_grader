@@ -17,7 +17,9 @@ const S = {
   recordData: null,
   archive: null,
   archClass: '',
-  qThumb: ''
+  qThumb: '',
+  batchEditId: null,
+  stuRecords: []
 };
 
 /* ==================================================================
@@ -85,6 +87,27 @@ function hasResult(e) {
   const r = eff(e);
   return !!(r && !isEmptyResult(r));
 }
+
+/* 得分口径：四维之和应当等于总分。模型偶尔先算四维、再把硬性扣分从总分里单独减一次，
+   于是报告上出现「内容6＋语言5＋结构1＋书写1＝13，总分却写 12」这种学生一眼能看出的矛盾。
+   平台不擅自改分（成绩以教师复核为准），只把差额标出来。 */
+const DIM_KEYS = ['content', 'language', 'structure', 'handwriting'];
+function dimTotal(r) {
+  if (!r || !r.dimensions) return null;
+  let sum = 0, has = false;
+  DIM_KEYS.forEach(function (k) {
+    const v = Number(r.dimensions[k]);
+    if (isFinite(v)) { sum += v; has = true; }
+  });
+  return has ? Math.round(sum * 10) / 10 : null;
+}
+/* 总分 − 四维合计；等于 0 表示口径自洽 */
+function scoreGap(r) {
+  const t = dimTotal(r);
+  if (t === null || !r || r.score === undefined || r.score === null) return 0;
+  return Math.round((Number(r.score) - t) * 10) / 10;
+}
+
 function fmtDate(iso) {
   if (!iso) return '';
   const d = new Date(iso);
@@ -133,12 +156,27 @@ document.querySelectorAll('.topnav button').forEach(function (b) {
   });
 });
 
+/* 数据文件损坏后从快照自动恢复过 —— 这件事必须让老师知道，不能悄悄发生 */
+function notifyRecovery(list) {
+  if (!list || !list.length) return;
+  try {
+    if (sessionStorage.getItem('recoveryNotified') === '1') return;
+    sessionStorage.setItem('recoveryNotified', '1');
+  } catch (e) { /* 隐私模式下 sessionStorage 不可用，照常提示 */ }
+  alert('检测到数据文件损坏，已自动从最近备份恢复：\n\n' +
+    list.map(function (x) { return '· ' + x.file + '  ←  ' + x.from; }).join('\n') +
+    '\n\n损坏的原文件已留档为 ' +
+    list.map(function (x) { return x.corrupt; }).join('、') +
+    '（在 data 目录下），可以自行检查。\n请核对最近的批改记录是否完整。');
+}
+
 /* ==================================================================
    初始化
    ================================================================== */
 async function loadState() {
   const st = await api('/api/state');
   if (!st.ok) { alert('读取数据失败：' + (st.error || '')); return; }
+  notifyRecovery(st.recovery);
   S.presets = st.presets || [];
   S.settings = st.settings || {};
   S.prompt = st.prompt || '';
@@ -211,28 +249,111 @@ document.getElementById('batchSelect').addEventListener('change', function () {
   if (this.value) openBatch(this.value);
 });
 
+/* 新建 / 修改批次共用一个表单：mode = 'new' 或 'edit' */
+function openBatchForm(mode) {
+  const c = document.getElementById('newBatchCard');
+  if (mode === 'edit') {
+    if (!S.current) { alert('请先选择一个批次'); return; }
+    S.batchEditId = S.current.id;
+    document.getElementById('nbCardTitle').textContent = '修改批次信息';
+    document.getElementById('nbDot').textContent = '改';
+    document.getElementById('nbCardSub').textContent = '改题目 / 默认班级 / 要点都不会影响已批改的结果';
+    document.getElementById('nbTitle').value = S.current.title || '';
+    document.getElementById('nbClass').value = S.current.className || '';
+    renderPoints(S.current.points && S.current.points.length ? S.current.points : ['']);
+    document.getElementById('btnCreateBatch').textContent = '保存修改';
+  } else {
+    S.batchEditId = null;
+    document.getElementById('nbCardTitle').textContent = '新建批改批次';
+    document.getElementById('nbDot').textContent = '新';
+    document.getElementById('nbCardSub').textContent = '题目与要点越准确，漏点判定越准';
+    document.getElementById('nbTitle').value = '';
+    document.getElementById('nbClass').value = '';
+    renderPoints(['']);
+    document.getElementById('btnCreateBatch').textContent = '创建批次';
+  }
+  c.style.display = 'block';
+  document.getElementById('nbTitle').focus();
+}
+function closeBatchForm() {
+  document.getElementById('newBatchCard').style.display = 'none';
+  S.batchEditId = null;
+}
+
 document.getElementById('btnNewBatch').addEventListener('click', function () {
   const c = document.getElementById('newBatchCard');
-  c.style.display = c.style.display === 'none' ? 'block' : 'none';
-  if (c.style.display === 'block') document.getElementById('nbTitle').focus();
+  // 再点一次同一个按钮就收起（原来是切换显示，保持这个手感）
+  if (c.style.display !== 'none' && S.batchEditId === null) { closeBatchForm(); return; }
+  openBatchForm('new');
 });
-document.getElementById('btnCancelBatch').addEventListener('click', function () {
-  document.getElementById('newBatchCard').style.display = 'none';
+document.getElementById('btnEditBatch').addEventListener('click', function () {
+  openBatchForm('edit');
 });
+document.getElementById('btnCancelBatch').addEventListener('click', closeBatchForm);
+
+/* ---- 核心要点：动态增删，数量不固定 ---- */
+function pointRow(value) {
+  return '<div class="prow"><input type="text" class="pt-in" value="' + esc(value || '') + '">' +
+    '<button class="btn sm ghost del" type="button" data-act="rmpoint">删除</button></div>';
+}
+function renumberPoints() {
+  document.querySelectorAll('#nbPoints .pt-in').forEach(function (el, i) {
+    el.placeholder = '要点 ' + (i + 1);
+  });
+}
+function renderPoints(values) {
+  const vals = (values && values.length) ? values : [''];
+  document.getElementById('nbPoints').innerHTML = vals.map(pointRow).join('');
+  renumberPoints();
+}
+function collectPoints() {
+  return Array.prototype.slice.call(document.querySelectorAll('#nbPoints .pt-in'))
+    .map(function (el) { return el.value.trim(); })
+    .filter(Boolean);
+}
+
+document.getElementById('btnAddPoint').addEventListener('click', function () {
+  const box = document.getElementById('nbPoints');
+  box.insertAdjacentHTML('beforeend', pointRow(''));
+  renumberPoints();
+  const ins = box.querySelectorAll('.pt-in');
+  if (ins.length) ins[ins.length - 1].focus();
+});
+document.getElementById('nbPoints').addEventListener('click', function (ev) {
+  const b = ev.target.closest('[data-act="rmpoint"]');
+  if (!b) return;
+  const rows = document.querySelectorAll('#nbPoints .prow');
+  if (rows.length <= 1) { renderPoints(['']); return; }
+  b.closest('.prow').remove();
+  renumberPoints();
+});
+renderPoints([]);
 
 document.getElementById('btnCreateBatch').addEventListener('click', async function () {
   const title = document.getElementById('nbTitle').value.trim();
   if (!title) { alert('请先填写作文题目'); return; }
-  const points = ['nbP1', 'nbP2', 'nbP3'].map((id) => document.getElementById(id).value.trim()).filter(Boolean);
-  const r = await api('/api/batch/create', {
-    title: title,
-    className: document.getElementById('nbClass').value.trim(),
-    points: points
-  });
+  const points = collectPoints();
+  const className = document.getElementById('nbClass').value.trim();
+
+  // 修改已有批次
+  if (S.batchEditId) {
+    const r0 = await api('/api/batch/update', {
+      id: S.batchEditId, title: title, className: className, points: points
+    });
+    if (!r0.ok) { alert('保存失败：' + r0.error); return; }
+    closeBatchForm();
+    await refreshSummaries();
+    await openBatch(r0.batch.id);
+    return;
+  }
+
+  const r = await api('/api/batch/create', { title: title, className: className, points: points });
   if (!r.ok) { alert('创建失败：' + r.error); return; }
-  ['nbTitle', 'nbClass', 'nbP1', 'nbP2', 'nbP3'].forEach((id) => { document.getElementById(id).value = ''; });
+  document.getElementById('nbTitle').value = '';
+  document.getElementById('nbClass').value = '';
+  renderPoints(['']);
   resetQuestionPhoto();
-  document.getElementById('newBatchCard').style.display = 'none';
+  closeBatchForm();
   await refreshSummaries();
   await openBatch(r.batch.id);
 });
@@ -336,9 +457,7 @@ async function handleQuestionPhoto(file) {
   const q = r.question || {};
   if (q.title) document.getElementById('nbTitle').value = q.title;
   const pts = q.points || [];
-  ['nbP1', 'nbP2', 'nbP3'].forEach(function (id, i) {
-    if (pts[i]) document.getElementById(id).value = pts[i];
-  });
+  renderPoints(pts.length ? pts : ['']);
 
   let html = '';
   if (q.title) html += '<div><b>题目：</b>' + esc(q.title) + '</div>';
@@ -350,10 +469,6 @@ async function handleQuestionPhoto(file) {
   if (pts.length) {
     html += '<div><b>识别到 ' + pts.length + ' 个要点：</b><ul>' +
       pts.map((p) => '<li>' + esc(p) + '</li>').join('') + '</ul></div>';
-    if (pts.length > 3) {
-      html += '<div style="color:var(--t4)">识别到 ' + pts.length +
-        ' 个要点，表单只有 3 个输入框，多出的请自行取舍或合并。</div>';
-    }
   } else {
     html += '<div class="bad">没有识别出明确的写作要点，请手动填写。</div>';
   }
@@ -389,9 +504,17 @@ function renderWorkbench() {
   sub.textContent = '创建于 ' + fmtDate(b.createdAt);
   info.innerHTML = '<div class="tip" style="margin-top:14px">' +
     '<b>题目：</b>' + esc(b.title) +
-    (b.className ? '　　<b>班级：</b>' + esc(b.className) : '') +
+    (b.className ? '　　<b>批次默认班级：</b>' + esc(b.className) : '') +
     '<br><b>核心要点：</b>' + pts +
     '<br><b>进度：</b>已上传 ' + b.essays.length + ' 篇　·　已批改 ' + done + ' 篇　·　教师已复核 ' + rev + ' 篇' +
+    (function () {
+      // 班级以每篇卷面识别为准，认不出的到登分表一键补
+      const blankCls = b.essays.filter((e) => !String((e.identity || {}).className || '').trim()).length;
+      return blankCls
+        ? '<br><b>班级：</b>按每篇卷面识别记，其中 ' + blankCls +
+          ' 篇还没识别到 —— 到「记录与统计 → 登分表」用「一键填写班级」批量补'
+        : '';
+    })() +
     '</div>';
 
   renderQueue();
@@ -692,6 +815,8 @@ function essayCard(e) {
     '<img class="thumb" src="/uploads/' + esc(e.file) + '" data-act="img" data-id="' + e.id + '" alt="">' +
     '<div class="meta"><div class="t1">' + e.no + ' 号作文　' + statusBadge(e) +
     (sc !== null && r && r.tier ? '<span class="badge ' + tierClass(sc) + '">' + esc(r.tier) + '</span>' : '') +
+    (sc !== null && scoreGap(r) !== 0 ? '<span class="badge bg-warn">得分待核</span>' : '') +
+    plagiarismBadge(e.ai && e.ai.plagiarism) +
     '</div><div class="t2">' + fmtDate(e.createdAt) +
     (r && r.wordCount ? '　·　识别词数 ' + r.wordCount : '') +
     (r && r.deductions && r.deductions.length ? '　·　扣分 ' + r.deductions.length + ' 项' : '') +
@@ -728,6 +853,16 @@ function essayCard(e) {
         dimBox('内容', d.content, 10) + dimBox('语言', d.language, 10) +
         dimBox('结构', d.structure, 3) + dimBox('书写', d.handwriting, 2) +
         '</div>';
+      const gt = dimTotal(r);
+      const gp = scoreGap(r);
+      if (gt !== null && gp !== 0) {
+        body += '<div class="blk warn"><h5>得分口径待核对</h5>' +
+          '四维合计 <b>' + gt + '</b> 分，最终得分 <b>' + r.score + '</b> 分，差 <b>' + Math.abs(gp) + '</b> 分。' +
+          '常见原因是 AI 先算出四维之和，又把硬性扣分从总分上单独减了一次。' +
+          '报告与成绩表会按「四维合计 ' + gt + (gp < 0 ? ' − 扣分 ' + Math.abs(gp) : ' ＋ 调整 ' + gp) +
+          ' ＝ ' + r.score + '」的口径展示；要改分数，点下面「教师复核 / 修改」。' +
+          '<div style="margin-top:6px">这属于口径问题，不影响你对这篇的实际判断。</div></div>';
+      }
       if (r.pointsDetail && r.pointsDetail.length) {
         const miss = r.pointsDetail.filter((p) => !p.covered).length;
         body += '<div class="blk points ' + (miss ? 'warn' : '') + '"><h5>要点核对　' +
@@ -738,6 +873,8 @@ function essayCard(e) {
               '<span>' + esc(p.point) + (p.note ? '　<span class="nt">' + esc(p.note) + '</span>' : '') + '</span></li>';
           }).join('') + '</ul></div>';
       }
+      body += errorsBlock(e.ai && e.ai.errors);
+      body += plagiarismBlock(e.ai && e.ai.plagiarism);
       if (r.deductions && r.deductions.length) {
         body += '<div class="blk warn"><h5>硬性扣分</h5><ul>' +
           r.deductions.map((x) => '<li>' + esc(x) + '</li>').join('') + '</ul></div>';
@@ -791,11 +928,46 @@ function dimBox(name, v, max) {
     (v === undefined || v === null ? '—' : v) + '<i> / ' + max + '</i></div></div>';
 }
 
+/* 逐句纠错块：三档及以上作文里 AI 标注出的每一个语言错误 */
+function errorsBlock(errors) {
+  if (!errors || !errors.length) return '';
+  return '<div class="blk"><h5>逐句纠错　' + errors.length + ' 处</h5><ul>' +
+    errors.map(function (er) {
+      let s = '<li><b class="wrong">' + esc(er.text || '') + '</b>';
+      if (er.fix) s += ' <span class="arw">→</span> <b class="right">' + esc(er.fix) + '</b>';
+      if (er.type) s += ' <span class="et">' + esc(er.type) + '</span>';
+      if (er.note) s += '<div class="en">' + esc(er.note) + '</div>';
+      return s + '</li>';
+    }).join('') + '</ul></div>';
+}
+
+/* 抄袭判定：判定抄袭 / 疑似抄袭两种情况，只给老师看，不进学生报告 */
+function plagiarismBadge(pl) {
+  if (!pl || !pl.verdict || pl.verdict === 'clean') return '';
+  if (pl.verdict === 'copied') return '<span class="badge bg-err">判定抄袭</span>';
+  return '<span class="badge bg-warn">疑似抄袭</span>';
+}
+function plagiarismBlock(pl) {
+  if (!pl || !pl.verdict || pl.verdict === 'clean') return '';
+  const copied = pl.verdict === 'copied';
+  let h = '<div class="blk warn"><h5>' +
+    (copied ? '判定抄袭：该部分不得分' : '疑似抄袭 · 待人工判断') + '</h5><div>';
+  const parts = [];
+  if (pl.kind) parts.push('<b>' + esc(pl.kind) + '</b>');
+  if (pl.note) parts.push(esc(pl.note));
+  h += parts.join('　·　');
+  h += '</div>';
+  if (!copied) h += '<div class="hint">AI 不能百分百确定，请点开原图人工核对后，再决定是否按抄袭处理。</div>';
+  return h + '</div>';
+}
+
 /* 卷面学生信息 + 作文标识。识别不到就留空交给老师补，不猜。 */
 function identityBlock(e) {
   const idt = e.identity || {};
   const idf = e.identifier || {};
-  const src = idt.source === 'manual' ? '<b>教师填写</b>' : (idt.source === 'ai' ? '卷面识别' : '卷面未写姓名');
+  const src = idt.source === 'manual' ? '<b>教师填写</b>'
+    : (idt.source === 'filename' ? '<b>文件名</b>'
+      : (idt.source === 'ai' ? '卷面识别' : '卷面未写姓名'));
   let h = '<div class="blk"><h5>学生信息与作文标识　<span class="nt" style="font-weight:400">（仅内部登分核对，不进学生报告）</span></h5>';
   h += '<div class="row">' +
     '<div><label class="lb">姓名</label><input type="text" id="idn-' + e.id + '" value="' + esc(idt.name || '') + '" placeholder="卷面未写，可手填"></div>' +
@@ -814,6 +986,17 @@ function identityBlock(e) {
   return h;
 }
 
+/* 复核表单里的合计提示：老师改分时立刻能看出四维与总分对不对得上 */
+function reviewSumHint(r) {
+  const d = (r && r.dimensions) || {};
+  const sum = (Number(d.content) || 0) + (Number(d.language) || 0) +
+    (Number(d.structure) || 0) + (Number(d.handwriting) || 0);
+  const sc = Number(r && r.score) || 0;
+  if (sum === sc) return '四维合计 ' + sum + ' 分 ＝ 最终得分 ' + sc + ' 分 ✓';
+  return '⚠ 四维合计 ' + sum + ' 分，最终得分 ' + sc + ' 分，差 ' +
+    Math.abs(sc - sum) + ' 分。两者相等才不会有争议。';
+}
+
 function reviewForm(e, r) {
   const d = r.dimensions || {};
   const tiers = ['一档（优秀）', '二档（良好）', '三档（合格）', '四档（较差）', '五档（极差）'];
@@ -829,6 +1012,7 @@ function reviewForm(e, r) {
     '<div><label class="lb">结构 /3</label><input type="number" id="rv-s-' + e.id + '" min="0" max="3" step="1" value="' + (d.structure || 0) + '"></div>' +
     '<div><label class="lb">书写 /2</label><input type="number" id="rv-h-' + e.id + '" min="0" max="2" step="0.5" value="' + (d.handwriting || 0) + '"></div>' +
     '</div>' +
+    '<div class="hint" id="rvsum-' + e.id + '">' + reviewSumHint(r) + '</div>' +
     '<div class="field" style="margin-top:12px"><label class="lb">硬性扣分 <small>每行一条</small></label>' +
     '<textarea id="rv-ded-' + e.id + '">' + esc((r.deductions || []).join('\n')) + '</textarea></div>' +
     '<div class="field"><label class="lb">核心问题 <small>每行一条</small></label>' +
@@ -956,6 +1140,22 @@ function openImg(e) {
 document.getElementById('modalClose').addEventListener('click', function () {
   document.getElementById('modal').classList.remove('on');
 });
+
+/* 复核表单里改分时实时合计：避免四维加起来对不上总分 */
+document.getElementById('essayList').addEventListener('input', function (ev) {
+  const t = ev.target;
+  const id = S.editing;
+  if (!t || !t.id || !id || t.id.indexOf('rv-') !== 0) return;
+  const box = document.getElementById('rvsum-' + id);
+  if (!box) return;
+  const val = (p) => Number((document.getElementById(p + '-' + id) || {}).value) || 0;
+  const sum = val('rv-c') + val('rv-l') + val('rv-s') + val('rv-h');
+  const sc = val('rv-score');
+  box.style.color = sum === sc ? '' : '#B45309';
+  box.textContent = sum === sc
+    ? '四维合计 ' + sum + ' 分 ＝ 最终得分 ' + sc + ' 分 ✓'
+    : '⚠ 四维合计 ' + sum + ' 分，最终得分 ' + sc + ' 分，差 ' + Math.abs(sc - sum) + ' 分。两者相等才不会有争议。';
+});
 document.getElementById('modal').addEventListener('click', function (ev) {
   if (ev.target === this) this.classList.remove('on');
 });
@@ -1030,6 +1230,9 @@ async function renderRecords() {
         '<span class="ct">' + buckets[i] + ' 人</span></div>';
     }).join('');
 
+  renderAnalysis(b);
+  renderClassAnalysis(b);
+
   document.getElementById('tableCard').style.display = 'block';
   const head = ['编号', '得分', '档次', '内容', '语言', '结构', '书写', '词数', '状态', '核心问题'];
   let html = '<thead><tr>' + head.map((h) => '<th>' + h + '</th>').join('') + '</tr></thead><tbody>';
@@ -1038,8 +1241,11 @@ async function renderRecords() {
     const empty = isEmptyResult(r2);
     const d = (r2 && r2.dimensions) || {};
     const sc = (r2 && r2.score !== undefined && !empty) ? r2.score : null;
+    const gap = sc !== null ? scoreGap(r2) : 0;
     html += '<tr><td><b>' + e.no + ' 号</b></td>' +
-      '<td><b>' + (sc !== null ? sc : '—') + '</b></td>' +
+      '<td><b>' + (sc !== null ? sc : '—') + '</b>' +
+      (gap !== 0 ? '<span class="badge bg-warn" style="margin-left:6px" title="四维合计 ' + dimTotal(r2) + ' 分，与总分差 ' + gap + ' 分">待核</span>' : '') +
+      '</td>' +
       '<td>' + (sc !== null && r2.tier ? '<span class="badge ' + tierClass(sc) + '">' + esc(r2.tier) + '</span>' : '—') + '</td>' +
       '<td>' + (!empty && d.content !== undefined ? d.content : '—') + '</td>' +
       '<td>' + (!empty && d.language !== undefined ? d.language : '—') + '</td>' +
@@ -1071,15 +1277,130 @@ async function backfillIdentifiers(batchId) {
   backfilled.add(batchId);
   try {
     const r = await api('/api/backfill', { batchId: batchId });
-    return r.ok ? (r.filled || 0) : 0;
+    // filled = 补出的作文标识，named = 从文件名补出的姓名，两者任一有变化都要重画表格
+    return r.ok ? ((r.filled || 0) + (r.named || 0)) : 0;
   } catch (e) { return 0; }
 }
 
 /* 登分表：编号 + 姓名/考号 + 标题 + 首句 + 得分。姓名等可直接在表里输入。 */
+/* 班级整体情况分析：纯本地统计，不额外花模型的钱。
+   四维平均分看弱项、要点漏写率看教学盲点、错误类型看共性、词数看硬性扣分风险。 */
+function renderAnalysis(b) {
+  const box = document.getElementById('analysis');
+  const scored = b.essays.map(function (e) { return { e: e, r: eff(e) }; })
+    .filter(function (x) { return x.r && x.r.score !== undefined && !isEmptyResult(x.r); });
+  const n = scored.length;
+  if (!n) { box.innerHTML = ''; return; }
+
+  // 四维平均
+  const dim = { content: 0, language: 0, structure: 0, handwriting: 0 };
+  scored.forEach(function (x) {
+    const d = x.r.dimensions || {};
+    ['content', 'language', 'structure', 'handwriting'].forEach(function (k) {
+      dim[k] += Number(d[k]) || 0;
+    });
+  });
+  ['content', 'language', 'structure', 'handwriting'].forEach(function (k) {
+    dim[k] = Math.round(dim[k] / n * 10) / 10;
+  });
+
+  // 要点漏写率（按批次核心要点的顺序，找不到同名的就跳过）
+  const pts = [];
+  (b.points || []).forEach(function (pt, i) {
+    let miss = 0, seen = 0;
+    scored.forEach(function (x) {
+      const pd = x.r.pointsDetail || [];
+      let p = pd[i];
+      if (!p) p = pd.find(function (q) { return q.point && q.point === pt; });
+      if (!p) return;
+      seen++;
+      if (!p.covered) miss++;
+    });
+    if (seen) pts.push({ point: pt, miss: miss, seen: seen, rate: Math.round(miss / seen * 100) });
+  });
+
+  // 错误类型聚合（来自逐句纠错的 type）
+  const tc = {};
+  scored.forEach(function (x) {
+    ((x.e.ai && x.e.ai.errors) || []).forEach(function (er) {
+      const t = String((er && er.type) || '').trim() || '未分类';
+      tc[t] = (tc[t] || 0) + 1;
+    });
+  });
+  const top = Object.keys(tc).map(function (t) { return { t: t, n: tc[t] }; })
+    .sort(function (a, b2) { return b2.n - a.n; }).slice(0, 6);
+
+  // 词数
+  let under = 0, over = 0;
+  scored.forEach(function (x) {
+    const w = x.r.wordCount;
+    if (w && w < 80) under++;
+    else if (w && w > 120) over++;
+  });
+
+  let h = '<div class="ana-h"><span class="dot">✦</span>班级整体情况分析<span class="sub">基于 ' + n + ' 篇已批改作文</span></div>';
+
+  h += '<div class="dims ana-dims">' +
+    dimBox('内容', dim.content, 10) + dimBox('语言', dim.language, 10) +
+    dimBox('结构', dim.structure, 3) + dimBox('书写', dim.handwriting, 2) + '</div>';
+
+  if (pts.length) {
+    const worst = pts.slice().sort(function (a, b2) { return b2.rate - a.rate; });
+    h += '<div class="blk ana-blk"><h5>要点覆盖（漏写率从高到低）</h5><ul>' +
+      worst.map(function (p) {
+        return '<li>' + esc(p.point) + '　漏写 ' + p.miss + '/' + p.seen + ' 篇（' + p.rate + '%）</li>';
+      }).join('') + '</ul></div>';
+  }
+
+  if (top.length) {
+    h += '<div class="blk ana-blk"><h5>常见错误类型</h5><div class="tags">' +
+      top.map(function (t) { return '<span class="tag"><b>' + esc(t.t) + '</b><span>' + t.n + ' 处</span></span>'; }).join('') +
+      '</div></div>';
+  }
+
+  if (under || over) {
+    h += '<div class="blk ana-blk"><h5>词数提醒</h5><ul>' +
+      (under ? '<li>低于 80 词：' + under + ' 篇（中考标准要扣 2 分）</li>' : '') +
+      (over ? '<li>超出 120 词：' + over + ' 篇（酌情扣分）</li>' : '') +
+      '</ul></div>';
+  }
+
+  box.innerHTML = h;
+}
+
+/* AI 班级共性分析 + 教学建议：按需生成，生成结果存到批次上 */
+function renderClassAnalysis(b) {
+  const box = document.getElementById('classAi');
+  const ca = b.classAnalysis;
+  if (!ca) {
+    box.innerHTML = '<div class="ana-h"><span class="dot">✦</span>AI 共性分析与教学建议' +
+      '<span class="sub">生成一次调用一次模型（纯文本，成本很低）</span></div>' +
+      '<button class="btn sm" id="btnGenClass">生成班级共性分析</button>';
+    return;
+  }
+  let h = '<div class="ana-h"><span class="dot">✦</span>AI 共性分析与教学建议' +
+    '<span class="sub">生成于 ' + fmtDate(ca.createdAt) + '</span></div>';
+  if (ca.commonStrengths && ca.commonStrengths.length) {
+    h += '<div class="blk ana-blk"><h5>全班做得好的地方</h5><ul>' +
+      ca.commonStrengths.map(function (s) { return '<li>' + esc(s) + '</li>'; }).join('') + '</ul></div>';
+  }
+  if (ca.commonProblems && ca.commonProblems.length) {
+    h += '<div class="blk warn ana-blk"><h5>共性存在的问题</h5><ul>' +
+      ca.commonProblems.map(function (s) { return '<li>' + esc(s) + '</li>'; }).join('') + '</ul></div>';
+  }
+  if (ca.guidance && ca.guidance.length) {
+    h += '<div class="blk ana-blk"><h5>下一阶段教学建议</h5><ul>' +
+      ca.guidance.map(function (s) { return '<li>' + esc(s) + '</li>'; }).join('') + '</ul></div>';
+  }
+  h += '<button class="btn sm ghost" id="btnGenClass">重新生成</button>';
+  box.innerHTML = h;
+}
+
 function renderRoster(b) {
   const card = document.getElementById('rosterCard');
   if (!b.essays.length) { card.style.display = 'none'; return; }
   card.style.display = 'block';
+  fillClassBar(b);
 
   const head = ['编号', '姓名', '班级', '考号', '作文标题', '正文首句', '得分', '档次', '状态'];
   let html = '<thead><tr>' + head.map((h) => '<th>' + h + '</th>').join('') + '</tr></thead><tbody>';
@@ -1087,7 +1408,8 @@ function renderRoster(b) {
     const r = hasResult(e) ? eff(e) : null;
     const idt = e.identity || {};
     const idf = e.identifier || {};
-    const src = idt.source === 'manual' ? '教师填写' : (idt.source === 'ai' ? '卷面识别' : '');
+    const src = idt.source === 'manual' ? '教师填写'
+      : (idt.source === 'filename' ? '文件名' : (idt.source === 'ai' ? '卷面识别' : ''));
     const box = (f, val, ph, w) => '<input type="text" class="rin' + (val ? ' filled' : '') +
       '" data-rf="' + f + '" data-re="' + e.id + '" value="' + esc(val || '') +
       '" placeholder="' + ph + '"' + (w ? ' style="min-width:' + w + '"' : '') + '>';
@@ -1100,7 +1422,10 @@ function renderRoster(b) {
       '<td>' + box('seatNo', idt.seatNo, '—', '80px') + '</td>' +
       '<td class="wrapcell">' + esc(idf.title || '未写标题') + '</td>' +
       '<td class="wrapcell" style="color:var(--ink2)">' + esc((idf.firstSentence || '—').slice(0, 60)) + '</td>' +
-      '<td><b>' + (r && r.score !== undefined ? r.score : '—') + '</b></td>' +
+      '<td><b>' + (r && r.score !== undefined ? r.score : '—') + '</b>' +
+      (r && r.score !== undefined && scoreGap(r) !== 0
+        ? '<span class="badge bg-warn" style="margin-left:6px" title="四维合计 ' + dimTotal(r) + ' 分">待核</span>' : '') +
+      '</td>' +
       '<td>' + (r && r.tier ? '<span class="badge ' + tierClass(r.score) + '">' + esc(r.tier) + '</span>' : '—') + '</td>' +
       '<td>' + (e.reviewed ? '<span class="badge bg-rev">已复核</span>'
         : (r ? '<span class="badge bg-done">AI 初评</span>' : '<span class="badge bg-pend">未批改</span>')) + '</td></tr>';
@@ -1108,6 +1433,74 @@ function renderRoster(b) {
   html += '</tbody>';
   document.getElementById('rosterTable').innerHTML = html;
 }
+
+/* ---- 一键填写班级：一个批次里混了几个班的卷子时批量补 ---- */
+function knownClasses() {
+  const list = [];
+  const add = function (v) {
+    const s = String(v || '').trim();
+    if (s && list.indexOf(s) === -1) list.push(s);
+  };
+  S.batches.forEach(function (b) { add(b.className); });
+  [S.current, S.recordData].forEach(function (b) {
+    if (b && b.essays) b.essays.forEach(function (e) { add((e.identity || {}).className); });
+  });
+  if (S.archive && S.archive.classes) S.archive.classes.forEach(function (c) { add(c.className); });
+  return list;
+}
+function refreshClassOptions() {
+  document.getElementById('clsOptions').innerHTML =
+    knownClasses().map(function (c) { return '<option value="' + esc(c) + '"></option>'; }).join('');
+}
+function fillClassBar(b) {
+  refreshClassOptions();
+  const input = document.getElementById('clsFillInput');
+  if (!input.value) input.value = (b && b.className) || '';
+  const blank = (b.essays || []).filter(function (e) {
+    return !String((e.identity || {}).className || '').trim();
+  }).length;
+  document.getElementById('clsFillHint').textContent = blank
+    ? '这一批还有 ' + blank + ' 篇没填班级'
+    : '这一批每篇都已有班级';
+  document.getElementById('btnFillClassBlank').disabled = !blank;
+}
+async function fillClass(mode) {
+  const id = S.recordBatch || (S.current && S.current.id);
+  if (!id) { alert('请先选择一个批次'); return; }
+  const cls = document.getElementById('clsFillInput').value.trim();
+  if (!cls) { alert('请先填写班级名称'); return; }
+  if (mode === 'all') {
+    const n = (S.recordData && S.recordData.id === id) ? S.recordData.essays.length : '';
+    if (!confirm('把这一批' + (n ? '全部 ' + n + ' 篇' : '每一篇') + '的班级都改成「' + cls + '」？\n\n' +
+      '已经识别出来的班级也会被覆盖。之后重新批改时，如果卷面上识别到班级，仍会以识别结果为准。')) return;
+  }
+  const r = await api('/api/class/fill', { batchId: id, className: cls, mode: mode });
+  if (!r.ok) { alert('填写失败：' + r.error); return; }
+  if (!r.filled) { alert('没有需要填写的作文。'); return; }
+  await renderRecords();
+  if (S.current && S.current.id === id) { await refreshCurrent(); renderWorkbench(); }
+}
+document.getElementById('btnFillClassBlank').addEventListener('click', function () { fillClass('blank'); });
+document.getElementById('btnFillClassAll').addEventListener('click', function () { fillClass('all'); });
+
+/* 生成 / 重新生成班级共性分析 */
+document.getElementById('classAi').addEventListener('click', async function (ev) {
+  const b = ev.target.closest('#btnGenClass');
+  if (!b) return;
+  const id = S.recordBatch || (S.current && S.current.id);
+  if (!id) { alert('请先选择一个批次'); return; }
+  b.disabled = true;
+  const old = b.textContent;
+  b.textContent = '生成中…（约十几秒）';
+  const r = await api('/api/class/analysis', { batchId: id });
+  if (!r.ok) {
+    b.disabled = false;
+    b.textContent = old;
+    alert('生成失败：' + (r.error || '未知错误'));
+    return;
+  }
+  await renderRecords();
+});
 
 /* 保存登分表某一行（三个字段一起提交，因为接口是整体覆盖） */
 async function saveRosterRow(essayId) {
@@ -1350,23 +1743,93 @@ async function renderStudentDetail(id) {
 
   // 历次明细
   h += '<div class="blk"><h5>历次作文明细</h5><div class="tbl-wrap"><table>' +
-    '<thead><tr><th>次序</th><th>日期</th><th>作文题目</th><th>本批编号</th><th>得分</th><th>档次</th><th>状态</th></tr></thead><tbody>';
+    '<thead><tr><th>次序</th><th>日期</th><th>作文题目</th><th>本批编号</th><th>得分</th><th>档次</th><th>状态</th><th></th></tr></thead><tbody>';
   recs.forEach(function (x, i) {
+    x.seq = i + 1;
     const d = new Date(x.date);
     const p = (n) => String(n).padStart(2, '0');
-    h += '<tr><td>第 ' + (i + 1) + ' 次</td>' +
+    h += '<tr data-rec="' + i + '" style="cursor:pointer" title="点击查看这一篇的完整批改信息">' +
+      '<td>第 ' + (i + 1) + ' 次</td>' +
       '<td>' + d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + '</td>' +
       '<td class="wrapcell">' + esc(x.batchTitle || '') + '</td>' +
       '<td>' + x.no + ' 号</td>' +
       '<td><b>' + (x.score === null ? '—' : x.score) + '</b></td>' +
       '<td>' + (x.tier ? '<span class="badge ' + tierClass(x.score) + '">' + esc(x.tier) + '</span>' : '—') + '</td>' +
-      '<td>' + (x.reviewed ? '<span class="badge bg-rev">已复核</span>' : '<span class="badge bg-done">AI 初评</span>') + '</td></tr>';
+      '<td>' + (x.reviewed ? '<span class="badge bg-rev">已复核</span>' : '<span class="badge bg-done">AI 初评</span>') + '</td>' +
+      '<td style="color:var(--blue);font-weight:600;white-space:nowrap">查看 ›</td></tr>';
   });
   h += '</tbody></table></div></div>';
 
+  S.stuRecords = recs;
   box.innerHTML = h;
   box.style.display = 'block';
   if (box.scrollIntoView) box.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+/* 档案里点开某一篇：完整批改信息（原图 + 判定过程） */
+function openRecDetail(rec) {
+  if (!rec) return;
+  const d = rec.dimensions || {};
+  const sc = (rec.score === undefined) ? null : rec.score;
+  const gap = sc === null ? 0 : scoreGap(rec);
+  let h = '<div class="rec-h"><div class="t">' + esc(rec.batchTitle || '（未填题目）') + '</div>' +
+    '<div class="s">第 ' + rec.seq + ' 次作文　·　' + fmtDate(rec.date) + '　·　本批 ' + rec.no + ' 号' +
+    (rec.className ? '　·　班级 ' + esc(rec.className) : '') + '</div></div>';
+
+  h += '<div class="rec-score"><b>' + (sc === null ? '—' : sc) + '</b><i> / 25</i>' +
+    (rec.tier && sc !== null ? '<span class="badge ' + tierClass(sc) + '">' + esc(rec.tier) + '</span>' : '') +
+    '<span class="badge ' + (rec.reviewed ? 'bg-rev' : 'bg-done') + '">' +
+    (rec.reviewed ? '教师已复核' : (sc === null ? '未批改' : 'AI 初评')) + '</span>' +
+    (rec.wordCount ? '<span class="rec-meta">识别词数 ' + rec.wordCount + '</span>' : '') + '</div>';
+
+  h += '<div class="dims">' +
+    dimBox('内容', d.content, 10) + dimBox('语言', d.language, 10) +
+    dimBox('结构', d.structure, 3) + dimBox('书写', d.handwriting, 2) + '</div>';
+  if (gap !== 0) {
+    h += '<div class="blk warn"><h5>得分口径</h5>四维合计 <b>' + dimTotal(rec) +
+      '</b> 分，最终得分 <b>' + sc + '</b> 分，差 <b>' + Math.abs(gap) + '</b> 分。' +
+      '报告与成绩表按「四维合计 ' + dimTotal(rec) + (gap < 0 ? ' − 扣分 ' + Math.abs(gap) : ' ＋ 调整 ' + gap) +
+      ' ＝ ' + sc + '」展示。</div>';
+  }
+  if (rec.pointsDetail && rec.pointsDetail.length) {
+    const miss = rec.pointsDetail.filter(function (p) { return !p.covered; }).length;
+    h += '<div class="blk points ' + (miss ? 'warn' : '') + '"><h5>要点核对　' +
+      (rec.pointsDetail.length - miss) + ' / ' + rec.pointsDetail.length + ' 已覆盖' +
+      (miss ? '　缺 ' + miss + ' 个 → 已降档' : '　全部覆盖') + '</h5><ul>' +
+      rec.pointsDetail.map(function (p) {
+        return '<li><span class="mk ' + (p.covered ? 'y' : 'n') + '">' + (p.covered ? '✓' : '✗') + '</span>' +
+          '<span>' + esc(p.point) + (p.note ? '　<span class="nt">' + esc(p.note) + '</span>' : '') + '</span></li>';
+      }).join('') + '</ul></div>';
+  }
+  h += errorsBlock(rec.errors);
+  h += plagiarismBlock(rec.plagiarism);
+  if (rec.deductions && rec.deductions.length) {
+    h += '<div class="blk warn"><h5>硬性扣分</h5><ul>' +
+      rec.deductions.map(function (x) { return '<li>' + esc(x) + '</li>'; }).join('') + '</ul></div>';
+  }
+  if (rec.problems && rec.problems.length) {
+    h += '<div class="blk warn"><h5>核心问题</h5><ul>' +
+      rec.problems.map(function (x) { return '<li>' + esc(x) + '</li>'; }).join('') + '</ul></div>';
+  }
+  if (rec.suggestions && rec.suggestions.length) {
+    h += '<div class="blk"><h5>改进建议</h5><ul>' +
+      rec.suggestions.map(function (x) { return '<li>' + esc(x) + '</li>'; }).join('') + '</ul></div>';
+  }
+  if (rec.comment) h += '<div class="blk"><h5>综合评语</h5><div class="ta">' + esc(rec.comment) + '</div></div>';
+  if (rec.modelEssay) h += '<div class="blk"><h5>适配水平优化范文</h5><div class="ta">' + esc(rec.modelEssay) + '</div></div>';
+  if (rec.transcription) h += '<div class="blk"><h5>识别原文</h5><div class="ta mono">' + esc(rec.transcription) + '</div></div>';
+  if (rec.file) {
+    h += '<div class="blk"><h5>原始照片</h5><img class="rec-img" src="/uploads/' + esc(rec.file) +
+      '" alt="作文原图"><div class="hint">点图片放大</div></div>';
+  }
+  if (sc === null && !rec.transcription && !rec.comment) {
+    h += '<div class="note">这一篇还没有批改结果。到工作台批改后再回来看。</div>';
+  }
+
+  document.getElementById('recBody').innerHTML = h;
+  document.getElementById('recCap').textContent = (rec.batchTitle || '') + ' · 本批 ' + rec.no + ' 号 · 第 ' + rec.seq + ' 次';
+  document.getElementById('recBody').scrollTop = 0;
+  document.getElementById('recModal').classList.add('on');
 }
 
 document.getElementById('classList').addEventListener('click', function (ev) {
@@ -1382,6 +1845,27 @@ document.getElementById('stuList').addEventListener('click', function (ev) {
   const tr = ev.target.closest('[data-stu]');
   if (!tr) return;
   renderStudentDetail(tr.dataset.stu);
+});
+
+/* 作文明细表：点行看详情 */
+document.getElementById('stuDetail').addEventListener('click', function (ev) {
+  const tr = ev.target.closest('[data-rec]');
+  if (!tr) return;
+  openRecDetail(S.stuRecords[Number(tr.dataset.rec)]);
+});
+document.getElementById('recClose').addEventListener('click', function () {
+  document.getElementById('recModal').classList.remove('on');
+});
+document.getElementById('recModal').addEventListener('click', function (ev) {
+  if (ev.target === this) this.classList.remove('on');
+});
+/* 详情里的照片点一下 → 用已有的放大弹层看原图 */
+document.getElementById('recBody').addEventListener('click', function (ev) {
+  const img = ev.target.closest('.rec-img');
+  if (!img) return;
+  document.getElementById('modalImg').src = img.getAttribute('src');
+  document.getElementById('modalCap').textContent = '作文原图';
+  document.getElementById('modal').classList.add('on');
 });
 
 document.getElementById('stuDetail').addEventListener('click', async function (ev) {
