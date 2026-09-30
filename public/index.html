@@ -45,6 +45,9 @@
           <button class="btn ghost" id="btnEditBatch">编辑批次</button>
         </div>
         <div style="flex:0 0 auto;min-width:0">
+          <button class="btn ghost" id="btnRosterList2" title="贴上本班「学号 + 姓名」，卷面上的考号就能自动对到人">班级名单</button>
+        </div>
+        <div style="flex:0 0 auto;min-width:0">
           <button class="btn ghost" id="btnDelBatch">删除批次</button>
         </div>
       </div>
@@ -137,8 +140,11 @@
     </div>
     <div class="card" id="rosterCard" style="display:none">
       <div class="card-h"><span class="dot">▤</span>登分表<span class="sp"></span>
+        <button class="btn sm ghost" id="btnRosterList" title="贴一次本班名单，卷面上的考号/学号就能自动对到人">班级名单</button>
+        <button class="btn sm ghost" id="btnScanNames" title="对还没认出姓名的篇目再跑一次卷首识别">识别姓名</button>
         <button class="btn sm" id="btnCopyRoster">复制登分表</button>
         <button class="btn sm dark" id="btnRoster">导出登分表（含姓名）</button>
+        <span class="hint" id="nameScanHint"></span>
       </div>
       <div class="clsbar">
         <b>一键填写班级</b>
@@ -148,7 +154,7 @@
         <span class="hint" id="clsFillHint"></span>
       </div>
       <div class="tbl-wrap"><table id="rosterTable"></table></div>
-      <div class="note"><b>姓名、班级、考号可以直接在这张表里点一下就能改</b>，改完点别处自动保存，按回车跳到下一行继续填，一路填下来很快。<br>姓名优先取你在表里填的，其次取卷面识别到的。「正文首句」用来快速辨认是哪一篇作文。<br><b>这份表含学生姓名，仅供你内部登分使用</b>，导出文件名已标注「仅内部使用」，请勿转发或上传。</div>
+      <div class="note"><b>姓名、班级、考号可以直接在这张表里点一下就能改</b>，改完点别处自动保存，按回车跳到下一行继续填，一路填下来很快。<br>姓名优先取你在表里填的，其次取卷面识别到的。「正文首句」用来快速辨认是哪一篇作文。<br><b>学生手写的姓名认不准怎么办：</b>先点「班级名单」贴上本班「学号 + 姓名」，再点「识别姓名」；卷面上的考号是阿拉伯数字，比草写汉字好认得多，认到考号就能定到人。<br><b>这份表含学生姓名，仅供你内部登分使用</b>，导出文件名已标注「仅内部使用」，请勿转发或上传。</div>
     </div>
 
     <div class="card" id="tableCard" style="display:none">

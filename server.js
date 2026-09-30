@@ -235,6 +235,46 @@ const QUESTION_PROMPT = `你是协助初三英语教师录入备课资料的助�
   "raw": "图片中作文题部分的完整文字内容"
 }`;
 
+/* 卷首学生信息专用提示词：只认「学生自己写在卷面上」的姓名 / 班级 / 考号。
+   和阅卷提示词分开、单独一次请求，好处是：
+     ① 这一趟只干一件事，模型注意力全在小字上，比顺带识别准；
+     ② 可以在前端把卷首裁出来放大后再送进来（模型看不了「局部放大」，只能我们自己裁）；
+     ③ 认错名字的代价很大（会把 A 的成绩记到 B 头上），所以这里要「给候选」而不是硬猜一个。 */
+const IDENTITY_PROMPT = `你要从一张初三英语作文卷面的照片里，抄录学生自己写在卷面上的身份信息：姓名、班级、考号 / 学号 / 座号。这些信息供教师在登分表里核对，抄错会把成绩记到别的学生头上，必须谨慎。
+
+【优先看哪里】
+- 最常见：卷首左上角或右上角，紧挨着作文标题上方或标题同一行，例如「九(2) 李小明 24」「九（8）班 李四 35」。姓名通常夹在班级和数字之间，或紧跟在数字前面。
+- 其次是左侧装订线、右侧页边、页脚：整行旋转 90° 竖排的小字，常标注「班级 / 姓名 / 考场 / 座次 / 座位号」。遇到旋转的文字，先在脑子里转正再读。
+- 四条边都扫一遍。这一趟只找身份信息，不要去读作文正文（正文里出现的 Li Hua 之类的名字不是学生信息）。
+
+【认手写姓名的办法】
+- 手写汉字连笔、潦草是常态。按「整体字形 + 偏旁轮廓 + 常见姓氏用字」判断，不要死抠每一笔。
+- 姓名一般是 2–4 个汉字，第一个字多为常见姓氏（王李张刘陈杨赵黄周吴徐孙胡朱高林何郭马罗梁宋郑谢韩唐冯于董萧程曹袁邓许傅沈曾彭吕苏卢蒋蔡贾丁魏薛叶阎余潘杜戴夏钟汪田任姜范方石姚谭廖邹熊金陆郝孔白崔康毛邱秦江史顾侯邵孟万段钱汤尹黎易常武乔贺赖龚文）。
+- 不确定时不要留空：把你认为最可能的写法填进 name，并把其它可能的读法按可能性排序放进 candidates（2–3 个）。宁可给出候选让老师点一下，也不要什么都不给。
+- 只标了姓氏、名字实在认不出时，name 里写「李」这样的单字也可以，并在 evidence 里说明「只认出姓」。
+- 反过来，卷面上确实没有姓名就留空，不要从作文正文或题目里凑一个名字出来。
+
+【数字与班级】
+- 考号 / 学号 / 座号是阿拉伯数字，通常比汉字好认，务必抄准；遇到 4 / 9、1 / 7、6 / 8 这类连笔，把你犹豫的其它读法写进 evidence。
+- 有座位号就填在 seatNo；卷面只写「考场 xx」的，seatNo 留空。
+- 班级照抄卷面写法（如「九(2)」「九二班」「92」「9A 2 班」），不要自己换算成别的格式。
+
+【图片说明】
+- 这条消息里可能有两张图：第 1 张是这份卷子的「卷首 + 左右边缘」放大拼图，第 2 张是整页照片；也可能只有其中一张。
+- 拼图上部和下面两条都来自同一份卷子，只是被切开放大，别当成几份不同的卷子。左右两条是竖排的边缘区域，已经旋转过 90°，可能需要你在脑中转正再读。
+- 只认学生自己手写的内容；老师打印的批改说明、标题、页码等印刷体不是学生信息。
+
+【输出要求】
+只输出一个 JSON 对象，不要任何解释文字，不要 markdown 代码块包裹。字段如下：
+{
+  "name": "卷面上学生自己写的姓名，认不出或确实没写就留空字符串",
+  "className": "卷面上写的班级，没写就留空字符串",
+  "seatNo": "卷面上写的考号 / 学号 / 座号（只要数字），没写就留空字符串",
+  "candidates": ["其它可能的姓名读法，按可能性排序，最多 3 个；没有就空数组"],
+  "evidence": "一句话说明你从哪里看到的，例如：卷首左上角、作文标题上方，姓名紧跟在「九(2)」和「24」之间",
+  "found": true 或 false（是否在卷面上找到了学生自己写的身份信息）
+}`;
+
 /* 为学生单独生成「适配水平优化范文」（用于打印后发给学生的报告） */
 const ESSAY_PROMPT = `你是拥有 15 年苏州高新区初三英语教学及中考阅卷经验的资深教师。现在你要为一名初三学生改写一篇「适配他现有水平」的优化范文，用于学生对照学习、课后背诵模仿。
 
@@ -332,6 +372,18 @@ function writeJson(file, obj) {
   // 队列自身始终保持在 resolved 状态：一次写入失败不能把后续所有写入连带卡死
   writeQueue = task.catch(() => {});
   return task;
+}
+
+/* 全局数据事务锁：把「读数据文件 → 修改 → 写回」的整个段落串行化。
+   只靠 writeJson 的写队列不够 —— 两个并发请求（双开标签页、批改进行中又点了别处）
+   各自拿着各自读到的旧数据整体写回，后写的会把先写的改动覆盖掉（丢更新）。
+   注意：锁不可重入，锁内不要再进 withData；AI 请求等慢操作必须放在锁外，
+   只把落库前后的短段落关进锁里。 */
+let dataLock = Promise.resolve();
+function withData(fn) {
+  const run = dataLock.then(fn);
+  dataLock = run.then(() => {}, () => {});
+  return run;
 }
 
 const uid = (p) => p + Math.random().toString(36).slice(2, 8) + Date.now().toString(36).slice(-4);
@@ -585,8 +637,28 @@ async function init() {
   // 体检通过后再留一份当天快照，作为下一次损坏的恢复点。
   await loadDb();
   await loadStudents();
+  await safeSnapshot(ROSTERS_FILE, 'rosters', { daily: true });
   await safeSnapshot(DB_FILE, 'db', { daily: true });
   await safeSnapshot(STUDENTS_FILE, 'students', { daily: true });
+
+  // 上次运行中途断电 / 强退时，可能有作文永远停在「批改中」——前端会一直转圈，
+  // 「重批未成功的作文」也不收这种状态。启动时统一复位成失败，让老师能一键重批。
+  const stuck = await withData(async function () {
+    const db = await loadDb();
+    let n = 0;
+    db.batches.forEach(function (b) {
+      b.essays.forEach(function (e) {
+        if (e.status === 'grading') {
+          e.status = 'error';
+          e.aiError = '上次批改被中断（服务中途停止），请重新批改这一篇。';
+          n++;
+        }
+      });
+    });
+    if (n) await writeJson(DB_FILE, db);
+    return n;
+  });
+  if (stuck) console.warn('  已把 ' + stuck + ' 篇中断在「批改中」的作文复位为待重批状态');
 
   // 真正写一次，确认目录可写。
   // 只看文件存不存在是不够的：文件都在、目录只读时，服务能正常启动，
@@ -636,16 +708,302 @@ function classDisplayMap(db, store) {
 
 /* 作文里的姓名与学生档案不一致时，自动重建一次索引（自愈，代价很小） */
 async function ensureLinked() {
-  const db = await loadDb();
-  let need = false;
-  for (const b of db.batches) {
-    for (const e of b.essays) {
-      const hasName = !!((e.identity || {}).name);
-      if (hasName !== !!e.studentId) { need = true; break; }
+  await withData(async function () {
+    const db = await loadDb();
+    let need = false;
+    for (const b of db.batches) {
+      for (const e of b.essays) {
+        const hasName = !!((e.identity || {}).name);
+        if (hasName !== !!e.studentId) { need = true; break; }
+      }
+      if (need) break;
     }
-    if (need) break;
+    if (need) await rebuildStudents();
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/* 班级名单：用来核定卷面上那行潦草的小字                                */
+/* ------------------------------------------------------------------ */
+/* 为什么需要名单：学生手写的姓名常常连笔，模型认不准、甚至干脆不敢认；
+   但紧挨着的考号 / 学号是阿拉伯数字，好认得多。认到数字 + 同班名单，
+   姓名就唯一确定了 —— 这是手写姓名最可靠的一条路。 */
+
+const ROSTERS_FILE = path.join(DATA_DIR, 'rosters.json');
+
+/* 班级的宽松归一：九(2)班 / 九2班 / 92 / 九二班 都算同一个班 */
+const CN_DIGIT = { '一': '1', '二': '2', '三': '3', '四': '4', '五': '5', '六': '6', '七': '7', '八': '8', '九': '9', '零': '0' };
+function classKey(s) {
+  return normKey(s)
+    .replace(/[一二三四五六七八九零]/g, function (c) { return CN_DIGIT[c]; })
+    .replace(/[班别]/g, '');
+}
+
+async function loadRosters() {
+  /* 与 db / students 一样严格读取：文件损坏时从快照恢复并留档坏文件，
+     而不是当成「还没有名单」—— 那样下一次保存会把坏文件覆盖掉，名单就真丢了 */
+  const r = await loadHealed(ROSTERS_FILE, 'rosters', { classes: [] });
+  if (!r || typeof r !== 'object' || Array.isArray(r) || !Array.isArray(r.classes)) return { classes: [] };
+  r.classes.forEach(function (c) {
+    if (!Array.isArray(c.students)) c.students = [];
+  });
+  return r;
+}
+
+/* 把教师粘贴的名单解析成 [{ seatNo, name }]。容错各种贴法：
+     「24 李小明」「李小明 24」「24,李小明」「李小明」
+     「| 12 | 24 | 李小明 | 334.0 | 89.0 |」（直接从成绩表里复制一整行）
+   规则：行里最后一个 2–4 字的汉字段当姓名，离它最近的那个数字当考号 / 学号。 */
+function parseRosterText(text) {
+  const out = [];
+  const byName = {};
+  /* 一个词是不是「考号 / 学号」：纯数字（可带「号」字）才算；分数 334.0 这种带小数的不算。
+     顺便标出「像座位号」的（1–60），用来在「序号 学号 姓名 总分」这种多列表格里挑对那一列。 */
+  const asSeat = function (v) {
+    const m = /^(\d{1,4})号?$/.exec(String(v || '').trim());
+    if (!m) return null;
+    const n = Number(m[1]);
+    return { seat: m[1], plausible: n >= 1 && n <= 60 };
+  };
+  String(text || '').split(/\r?\n/).forEach(function (line) {
+    const s = String(line).replace(/[|｜*]/g, ' ').replace(/\.\s/g, '. ').trim();
+    if (!s) return;
+    const tokens = s.split(/[\s,，、;；\t]+/).filter(Boolean);
+    let nameIdx = -1;
+    // 只在前 3 列里找姓名：贴过来的多半是「学号 姓名」「序号 学号 姓名」「姓名 学号」，
+    // 姓名总在前几列；这样右边的备注（「物理偏弱」「总分垫底」）就不会被当成名字。
+    for (let i = 0; i < tokens.length && i < 3; i++) {
+      const t = tokens[i];
+      if (!/^[\u4e00-\u9fa5·]{2,4}$/.test(t)) continue;
+      if (NOT_A_NAME.test(t)) continue;
+      if (/^(姓名|学号|考号|班级|座号|座位|序号|总分|性别)$/.test(t)) continue;
+      nameIdx = i;
+    }
+    if (nameIdx < 0) return;
+    const name = tokens[nameIdx];
+    let seat = '', fallback = '';
+    for (let d = 1; d <= 2 && !seat; d++) {
+      // 同一个距离上先看右边再看左边：「李小明 24」和「24 李小明」两种写法都要认；
+      // 成绩表里右边常跟着分数（334.0 或 > 60），会被 plausible 挡掉，于是落到左边的 24。
+      [tokens[nameIdx + d], tokens[nameIdx - d]].forEach(function (tk) {
+        const p = asSeat(tk);
+        if (!p) return;
+        if (p.plausible && !seat) seat = p.seat;
+        else if (!fallback && !p.plausible) fallback = p.seat;
+      });
+    }
+    if (!seat) seat = fallback;
+    // 同一个人被贴了两遍只留一条；带考号的那条优先（「李小明 24」比光一个姓名有用）
+    const exist = byName[name];
+    if (exist) {
+      if (!exist.seatNo && seat) exist.seatNo = seat;
+      return;
+    }
+    const item = { seatNo: seat, name: name };
+    byName[name] = item;
+    out.push(item);
+  });
+  return out;
+}
+
+function digitsOf(v) { return String(v === undefined || v === null ? '' : v).replace(/[^\d]/g, ''); }
+
+function rosterOf(store, className) {
+  const k = classKey(className);
+  if (!k) return null;
+  return store.classes.find(function (c) { return classKey(c.className) === k; }) || null;
+}
+
+/* 两个姓名的相似度：最长公共子序列 ÷ 较长名字长度。
+   「李小明 / 李小华」这类只错一两个字的，得分落在 0.3–0.7 之间，正好用来排序候选。 */
+function nameSimilarity(a, b) {
+  a = String(a || '').trim();
+  b = String(b || '').trim();
+  if (!a || !b) return 0;
+  if (a === b) return 1;
+  const m = a.length, n = b.length;
+  const dp = [];
+  for (let i = 0; i <= m; i++) dp.push(new Array(n + 1).fill(0));
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      dp[i][j] = a[i - 1] === b[j - 1] ? dp[i - 1][j - 1] + 1 : Math.max(dp[i - 1][j], dp[i][j - 1]);
+    }
   }
-  if (need) await rebuildStudents();
+  return dp[m][n] / Math.max(m, n);
+}
+
+function normalizeIdentity(d) {
+  const str = function (v) { return String(v === undefined || v === null ? '' : v).trim(); };
+  const cands = [];
+  const push = function (v) {
+    const s = str(v).replace(/[()（）]/g, '');
+    if (s && /^[\u4e00-\u9fa5·]{1,5}$/.test(s) && cands.indexOf(s) === -1) cands.push(s);
+  };
+  if (Array.isArray(d && d.candidates)) (d.candidates || []).forEach(push);
+  else push(d && d.candidates);
+  return {
+    name: str(d && (d.name || d.studentName || d.student)).replace(/[()（）]/g, ''),
+    className: str(d && (d.className || d.class || d.gradeClass || d.classRoom)),
+    seatNo: digitsOf(d && (d.seatNo || d.seat || d.examNo || d.studentNo || d.number)).slice(0, 8),
+    candidates: cands.slice(0, 3),
+    evidence: str(d && (d.evidence || d.note || d.where)),
+    found: !!(d && d.found)
+  };
+}
+
+/* 拿名单核对识别结果，返回 { name, className, seatNo, matchedBy, rosterName, candidates, note }
+   matchedBy: seat = 考号命中（最可靠）；name = 姓名与名单高度相似；conflict = 考号与姓名互相矛盾，请老师点 */
+function reconcileWithRoster(store, className, read) {
+  const seat = digitsOf(read.seatNo);
+  const name = String(read.name || '').trim();
+  const res = {
+    name: name,
+    className: String(read.className || '').trim(),
+    seatNo: seat,
+    matchedBy: '',
+    rosterName: '',
+    candidates: [],
+    note: '',
+    evidence: String(read.evidence || '').trim()
+  };
+  const pushCand = function (nm, st, from, score) {
+    nm = String(nm || '').trim();
+    if (!nm) return;
+    if (res.candidates.some(function (c) { return c.name === nm; })) return;
+    res.candidates.push({ name: nm, seatNo: String(st || ''), from: from, score: score });
+  };
+
+  let cls = rosterOf(store, res.className || className);
+  if (!cls && seat) {
+    // 班级没认出来时，用考号跨班找，全班只命中一个才敢用
+    const hits = store.classes.filter(function (c) {
+      return c.students.some(function (s) { return digitsOf(s.seatNo) === seat; });
+    });
+    if (hits.length === 1) cls = hits[0];
+  }
+
+  if (cls) {
+    if (!res.className) res.className = cls.className;
+    const bySeat = seat ? cls.students.find(function (s) { return digitsOf(s.seatNo) === seat; }) : null;
+    let rival = null, rivalScore = 0;
+    if (name) {
+      cls.students.forEach(function (s) {
+        const sc = nameSimilarity(s.name, name);
+        if (sc > rivalScore) { rivalScore = sc; rival = s; }
+      });
+    }
+    if (bySeat) {
+      // 考号指向 A，但认出来的字更像 B —— 两边都摆出来让老师点一下，别自作主张
+      if (rival && rival.name !== bySeat.name && rivalScore >= 0.66) {
+        res.matchedBy = 'conflict';
+        res.rosterName = bySeat.name;
+        res.note = '考号 ' + seat + ' 号在名单里是「' + bySeat.name + '」，但认出的字更像「' + rival.name + '」，请核对';
+        pushCand(bySeat.name, bySeat.seatNo, 'roster', 1);
+        pushCand(rival.name, rival.seatNo, 'roster', Math.round(rivalScore * 100) / 100);
+      } else {
+        res.matchedBy = 'seat';
+        res.rosterName = bySeat.name;
+      }
+    } else if (seat) {
+      res.note = '班级名单里没有 ' + seat + ' 号 —— 名单可能是别的班的，或者这个学生换了学号';
+    }
+    if (!res.rosterName && rival && rivalScore >= 0.66) {
+      res.matchedBy = 'name';
+      res.rosterName = rival.name;
+    }
+    if (name) {
+      cls.students
+        .map(function (s) { return { s: s, sc: nameSimilarity(s.name, name) }; })
+        .filter(function (x) { return x.sc >= 0.32; })
+        .sort(function (a, b) { return b.sc - a.sc; })
+        .slice(0, 3)
+        .forEach(function (x) { pushCand(x.s.name, x.s.seatNo, 'roster', Math.round(x.sc * 100) / 100); });
+    }
+  } else if (seat || name) {
+    res.note = '还没有「' + (res.className || className || '这个班') + '」的名单，识别结果没有名单可核对';
+  }
+
+  (read.candidates || []).forEach(function (c) { pushCand(c, '', 'ai', 0); });
+  res.candidates = res.candidates.slice(0, 4);
+  return res;
+}
+
+/* 把识别/核对结果并进作文记录。
+   cur.source === 'manual'（教师手填过）时一律不动，除非教师自己点了「识别姓名」重跑（force）。 */
+function mergeIdentityPatch(cur, patch, force) {
+  cur = cur || {};
+  const has = function (v) { return !!String(v === undefined || v === null ? '' : v).trim(); };
+  if (cur.source === 'manual' && !force) return null;
+  // 名单核定的姓名优先（考号/学号是数字，最不容易认错）；冲突时也先按考号定，把另一种读法留作候选并给出提示
+  const rosterName = patch.matchedBy && has(patch.rosterName) ? patch.rosterName : '';
+  let name;
+  if (force) name = has(rosterName) ? rosterName : (has(patch.name) ? patch.name : cur.name);
+  else if (has(rosterName)) name = rosterName;
+  else name = has(cur.name) ? cur.name : patch.name;
+  const nameOut = String(name || '');
+  const classOut = String((force ? (has(patch.className) ? patch.className : cur.className)
+    : (has(cur.className) ? cur.className : patch.className)) || '');
+  const seatOut = String((force ? (has(patch.seatNo) ? patch.seatNo : cur.seatNo)
+    : (has(cur.seatNo) ? cur.seatNo : patch.seatNo)) || '');
+  let source = cur.source || 'none';
+  if (has(rosterName) && nameOut === rosterName) source = 'roster';
+  else if (!has(cur.name) && has(nameOut)) source = 'ai';
+  const identity = {
+    name: nameOut, className: classOut, seatNo: seatOut, source: source,
+    updatedAt: new Date().toISOString()
+  };
+  const changed = nameOut !== String(cur.name || '') || classOut !== String(cur.className || '') ||
+    seatOut !== String(cur.seatNo || '') || source !== (cur.source || 'none');
+  return { identity: identity, changed: changed };
+}
+
+/* 读图 → 认身份 → 名单核对，返回 { ok, read, merged }。不写盘，由调用方决定怎么落库。 */
+async function readEssayIdentity(settings, batch, essay) {
+  const images = [];
+  const add = async function (file, mime) {
+    if (!file) return;
+    try {
+      images.push({ buf: await fsp.readFile(path.join(UPLOAD_DIR, file)), mime: mime || 'image/jpeg' });
+    } catch (e) { /* 文件不在就当没有 */ }
+  };
+  // 优先用上传时裁好的「卷首 + 边缘放大图」：同样一次请求，小字看得清得多
+  if (essay.identityShot) await add(essay.identityShot, 'image/jpeg');
+  await add(essay.file, essay.mime);
+  if (!images.length) return { ok: false, error: '找不到这一篇的作文照片，无法识别姓名' };
+
+  const r = await askWithImages(settings, IDENTITY_PROMPT,
+    '请识别图片上学生自己写的身份信息（姓名 / 班级 / 考号），只返回 JSON。',
+    images,
+    function (d) {
+      return !!(d && typeof d === 'object' &&
+        (d.name || d.className || d.seatNo || d.found !== undefined ||
+          (Array.isArray(d.candidates) && d.candidates.length)));
+    });
+  if (!r.ok) return { ok: false, error: r.reason, raw: r.raw };
+
+  const read = normalizeIdentity(r.data);
+  const store = await loadRosters();
+  const cur = essay.identity || {};
+  const merged = reconcileWithRoster(store, read.className || cur.className || (batch && batch.className) || '', read);
+  return { ok: true, read: read, merged: merged, hadShot: !!essay.identityShot };
+}
+
+/* 把一次识别结果落到作文记录上，返回可给前端展示的说明 */
+function applyIdentityScan(essay, merged, read, force) {
+  const patch = mergeIdentityPatch(essay.identity, merged, force);
+  if (patch) essay.identity = patch.identity;
+  const idt = essay.identity || {};
+  const finalName = String(idt.name || '').trim();
+  const cands = (merged.candidates || []).filter(function (c) { return c.name !== finalName; });
+  essay.nameCandidates = cands;
+  essay.idScan = {
+    at: new Date().toISOString(),
+    read: { name: read.name, className: read.className, seatNo: read.seatNo },
+    matchedBy: merged.matchedBy || '',
+    note: merged.note || '',
+    evidence: merged.evidence || ''
+  };
+  return { identity: idt, candidates: cands, scan: essay.idScan };
 }
 
 /* ------------------------------------------------------------------ */
@@ -834,21 +1192,23 @@ function scoreGapOf(r) {
   return Math.round((Number(r.score) - total) * 10) / 10;
 }
 
-async function requestOnce(settings, systemPrompt, userText, buf, mime, useJson) {
-  const b64 = buf.toString('base64');
-
+/* images：[{ buf, mime }] 或单个 Buffer。可以是多张图（同一份卷子的卷首 / 边缘局部），
+   要求接口按顺序把它们都放进同一条 user 消息，提示词里按「第 1 张、第 2 张」指代。 */
+async function requestOnce(settings, systemPrompt, userText, images, useJson) {
+  const list = (Array.isArray(images) ? images : [images]).filter(function (im) { return im && im.buf; });
+  const parts = [{ type: 'text', text: userText }];
+  list.forEach(function (im) {
+    parts.push({
+      type: 'image_url',
+      image_url: { url: 'data:' + (im.mime || 'image/jpeg') + ';base64,' + im.buf.toString('base64') }
+    });
+  });
   const body = {
     model: settings.model,
     max_tokens: Number(settings.maxTokens) > 0 ? Number(settings.maxTokens) : 8192,
     messages: [
       { role: 'system', content: systemPrompt },
-      {
-        role: 'user',
-        content: [
-          { type: 'text', text: userText },
-          { type: 'image_url', image_url: { url: 'data:' + (mime || 'image/jpeg') + ';base64,' + b64 } }
-        ]
-      }
+      { role: 'user', content: parts }
     ]
   };
 
@@ -865,8 +1225,9 @@ async function requestOnce(settings, systemPrompt, userText, buf, mime, useJson)
   if (useJson) body.response_format = { type: 'json_object' };
 
   const endpoint = String(settings.baseUrl || '').replace(/\/+$/, '') + '/chat/completions';
+  const timeoutSec = Number(settings.timeout) > 0 ? Number(settings.timeout) : 180;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), (settings.timeout || 180) * 1000);
+  const timer = setTimeout(() => controller.abort(), timeoutSec * 1000);
 
   let res;
   try {
@@ -881,6 +1242,13 @@ async function requestOnce(settings, systemPrompt, userText, buf, mime, useJson)
     });
   } catch (e) {
     clearTimeout(timer);
+    // 超时中断在 fetch 里只是一个含糊的 AbortError，必须单独点明是超时，
+    // 否则老师会照着「检查接口地址与网络」去排查一个根本不存在的问题
+    if (e && e.name === 'AbortError') {
+      const err = new Error('请求超时：模型在 ' + timeoutSec + ' 秒内没有返回。可到「设置」把「超时（秒）」调大，或换一个更快的模型后重试');
+      err.isTimeout = true;
+      throw err;
+    }
     throw new Error('网络请求失败：' + (e && e.message ? e.message : e) + '（请检查接口地址与网络）');
   }
   clearTimeout(timer);
@@ -912,26 +1280,42 @@ async function requestOnce(settings, systemPrompt, userText, buf, mime, useJson)
 }
 
 /* 带自动重试的图片问答：第一次按 forceJson 设置，失败后换一种模式重试一次。
-   validate 用于判断「解析成功但内容无效」的情况（模型返回空模板），这类也算失败。 */
-async function askWithImage(settings, systemPrompt, userText, buf, mime, validate) {
+   validate 用于判断「解析成功但内容无效」的情况（模型返回空模板），这类也算失败。
+   images 可以是 [{ buf, mime }] 多张图，也可以是单个 Buffer + mime。 */
+async function askWithImages(settings, systemPrompt, userText, images, validate) {
   const ok = validate || function () { return true; };
-  let r = await requestOnce(settings, systemPrompt, userText, buf, mime, !!settings.forceJson);
+  let r;
+  let firstError = null;
+  try {
+    r = await requestOnce(settings, systemPrompt, userText, images, !!settings.forceJson);
+  } catch (e) {
+    // 第一次就网络失败 / 超时：记下来继续走重试。
+    // 批量批改几十篇时，瞬时网络抖动是最常见的失败，不重试等于整篇白跑一趟。
+    firstError = e;
+    r = { parsed: null, raw: '', finish: '' };
+  }
   if (r.parsed && ok(r.parsed)) return { ok: true, data: r.parsed };
 
   const firstRaw = r.raw;
   const firstFinish = r.finish;
   const firstParsed = r.parsed;
 
-  try {
-    const r2 = await requestOnce(settings, systemPrompt, userText, buf, mime, !settings.forceJson);
-    if (r2.parsed && ok(r2.parsed)) return { ok: true, data: r2.parsed };
-    r = r2;
-  } catch (e) {
-    // 第二次失败时保留第一次的信息
+  let retried = false;
+  if (!firstError || !firstError.isTimeout) {
+    // 超时不重试：同一张图再等一轮超时，只会把整批的时间拖长一倍
+    try {
+      const r2 = await requestOnce(settings, systemPrompt, userText, images, !settings.forceJson);
+      retried = true;
+      if (r2.parsed && ok(r2.parsed)) return { ok: true, data: r2.parsed };
+      r = r2;
+    } catch (e) {
+      // 第二次失败时保留第一次的信息
+    }
   }
 
   let reason = 'AI 未返回标准 JSON';
-  if (firstParsed && !ok(firstParsed)) reason = '模型返回了空结果（没有任何识别文本或评语）';
+  if (firstError) reason = String(firstError.message || firstError);
+  else if (firstParsed && !ok(firstParsed)) reason = '模型返回了空结果（没有任何识别文本或评语）';
   else if (!firstRaw.trim()) reason = '模型返回了空内容';
   if (firstFinish === 'length') {
     reason = '输出被长度限制截断。' + (settings.thinking === 'on'
@@ -940,9 +1324,13 @@ async function askWithImage(settings, systemPrompt, userText, buf, mime, validat
   }
   return {
     ok: false,
-    reason: reason + '（已自动重试 1 次）',
+    reason: reason + (retried ? '（已自动重试 1 次）' : ''),
     raw: String(r.raw || firstRaw || '').slice(0, 3000)
   };
+}
+
+async function askWithImage(settings, systemPrompt, userText, buf, mime, validate) {
+  return askWithImages(settings, systemPrompt, userText, [{ buf: buf, mime: mime }], validate);
 }
 
 /* 一次有效的作文批改，至少要给出识别文本或评语，否则视为失败而不是 0 分 */
@@ -1345,141 +1733,297 @@ function buildDocx(bodyXml) {
   ]);
 }
 
-/* 单个学生一页的报告 */
+/* 单个学生一页的报告                                                        */
+/* 目标：每名学生固定占一页。先按默认版式排版，若估算高度超出页面可用高度，  */
+/* 就逐级压缩字号与段间距；仍放不下时再精简内容（少列几条、缩短评语/范文）。 */
 const CN_NUM = ['一', '二', '三', '四', '五', '六', '七', '八', '九', '十'];
 
-function buildStudentPage(batch, essay, r, essayRes, index) {
+/* --- 版面计量：把段落高度换算成 twips，用来判断一页放不放得下 --- */
+const PAGE_W_TW = 11906;      // A4 宽（与 buildDocx 的 pgSz 一致）
+const PAGE_H_TW = 16838;      // A4 高
+const MARGIN_TW = 1021;       // 上下左右页边距
+const TEXT_W_TW = PAGE_W_TW - MARGIN_TW * 2;          // 正文可用宽度 9864
+const AVAIL_H_TW = PAGE_H_TW - MARGIN_TW * 2;         // 正文可用高度 14796
+const LINE_FACTOR = 1.4;      // 单倍行距下的行高系数（略偏大，给实际渲染留余量）
+const FIT_LIMIT_TW = AVAIL_H_TW - 420;  // 排版高度阈值：再预留一行的余量，避免估算误差导致溢出第二页
+
+/* 估算一个字符占几个 em：中文/全角按 1，ASCII 按 0.55，空格更窄 */
+function charEm(ch) {
+  const c = ch.codePointAt(0);
+  if ((c >= 0x2E80 && c <= 0x9FFF) || (c >= 0xF900 && c <= 0xFAFF) ||
+      (c >= 0x3000 && c <= 0x303F) || (c >= 0xFF00 && c <= 0xFFEF) ||
+      (c >= 0x2013 && c <= 0x2014) || c === 0x00B7) return 1.0;
+  if (ch === ' ') return 0.3;
+  return 0.55;
+}
+
+/* 文字渲染宽度（pt）：每字符宽度 = 字宽系数 × 字号（size 为半磅） */
+function textWidthPt(text, size) {
+  let w = 0;
+  const s = String(text === undefined || text === null ? '' : text);
+  for (const ch of s) w += charEm(ch) * (size / 2);
+  return w;
+}
+
+/* 单个段落占用的高度（twips）：行数 × 行高 + 段前段后间距 */
+function paraHeight(widthPt, maxSizeHalfPt, o) {
+  const indent = o.indent || 0;
+  const availPt = (TEXT_W_TW - indent) / 20;
+  const lines = Math.max(1, Math.ceil(widthPt / availPt));
+  const lineH = (maxSizeHalfPt / 2) * LINE_FACTOR * 20;
+  return lines * lineH + (o.before || 0) + (o.after || 0);
+}
+
+/* 按最大字数截断长文本，尽量断在空格处并补省略号 */
+function clipText(s, max) {
+  if (max == null || !s || s.length <= max) return s;
+  let t = s.slice(0, max);
+  const sp = t.lastIndexOf(' ');
+  if (sp > max * 0.6) t = t.slice(0, sp);
+  return t.replace(/[\s，。；、,.]+$/, '') + '…';
+}
+
+/* 默认字号（半磅）与段间距，供各级压缩样式覆盖 */
+const SIZES_BASE = {
+  headTitle: 24,  // 页眉标题「英语作文批改报告」
+  name: 19,       // 页眉的编号/姓名
+  section: 20,    // 一、二、三 各小节标题
+  label: 20,      // 作文题目、得分 等标签
+  score: 32,      // 分数
+  tier: 22,       // 档次
+  dim: 19,        // 四维度、词数
+  gapNote: 18,    // 四维合计说明
+  body: 19,       // 要点/纠错/问题/建议/评语正文
+  model: 20,      // 范文正文
+  noteHead: 19,   // 「为什么这样改 / 好词好句」小标题
+  note: 18,       // 修改说明
+  key: 18,        // 好词好句
+  placeholder: 18 // 尚未生成范文的提示
+};
+
+function mkSize(over) { return Object.assign({}, SIZES_BASE, over); }
+
+/* 由松到紧的排版方案：字号递减、段间距收紧，最后两级开始精简内容。
+   lim 里未出现的键表示不限制。 */
+const FIT_PRESETS = [
+  { size: mkSize({}), after: 1.00, lim: {} },
+  {
+    size: mkSize({
+      headTitle: 22, section: 19, label: 19, score: 30, tier: 20, dim: 17,
+      gapNote: 16, body: 18, model: 19, noteHead: 18, note: 17, key: 17, placeholder: 17
+    }),
+    after: 0.82,
+    lim: {}
+  },
+  {
+    size: mkSize({
+      headTitle: 21, section: 18, label: 18, score: 28, tier: 19, dim: 16,
+      gapNote: 15, body: 17, model: 18, noteHead: 17, note: 16, key: 16, placeholder: 16
+    }),
+    after: 0.66,
+    lim: { problems: 2, suggestions: 2, notes: 1, keys: 3 }
+  },
+  {
+    size: mkSize({
+      headTitle: 20, section: 17, label: 17, score: 26, tier: 18, dim: 15,
+      gapNote: 14, body: 16, model: 17, noteHead: 16, note: 15, key: 15, placeholder: 15
+    }),
+    after: 0.5,
+    lim: {
+      problems: 2, suggestions: 2, notes: 0, keys: 0,
+      errors: 3, omitPointNote: true, commentChars: 90, modelChars: 360
+    }
+  },
+  {
+    size: mkSize({
+      headTitle: 20, section: 16, label: 16, score: 26, tier: 18, dim: 15,
+      gapNote: 14, body: 16, model: 16, noteHead: 15, note: 15, key: 15, placeholder: 15
+    }),
+    after: 0.4,
+    lim: {
+      // 最后一档：给所有仍不受限的长字段都加上硬上限，确保一定装进一页
+      titleChars: 50, points: 5, pointChars: 30,
+      problems: 1, problemChars: 50, suggestions: 1, suggestionChars: 50,
+      notes: 0, keys: 0, errors: 0, omitPointNote: true,
+      commentChars: 60, modelChars: 180
+    }
+  }
+];
+
+/* 生成单个学生页；同时累计估算高度，供 fitStudentPage 判断是否放得下。
+   cfg = { size: {…}, after: 段间距系数, lim: {…} } */
+function buildStudentPage(batch, essay, r, essayRes, index, cfg) {
+  cfg = cfg || FIT_PRESETS[0];
+  const S = cfg.size;
+  const lim = cfg.lim || {};
+  const afterScale = cfg.after || 1;
   const d = (r && r.dimensions) || {};
   const valid = r && !isEmptyResult(r);
   const score = valid ? (r.score !== undefined ? r.score : '—') : '—';
   const tier = valid && r.tier ? r.tier : '未批改';
-  const pts = (valid && r.pointsDetail) || [];
+  const pts = (valid && r.pointsDetail) ? r.pointsDetail.slice(0, lim.points == null ? Infinity : lim.points) : [];
 
   let x = '';
+  let est = 0;                    // 估算高度（twips）
   let sec = 0;                    // 章节号动态递增，避免出现「二、」却找不到「一、」
   const nextSec = function () { return CN_NUM[sec++] + '、'; };
 
+  // 追加一段：既拼 XML，又累计估算高度
+  function add(runs, o) {
+    o = o || {};
+    let xml = '';
+    let widthPt = 0;
+    let maxSize = 0;
+    runs.forEach(function (rn) {
+      xml += wRun(rn.text, rn);
+      const sz = rn.size || 20;
+      if (sz > maxSize) maxSize = sz;
+      widthPt += textWidthPt(rn.text, sz);
+    });
+    const oo = Object.assign({}, o);
+    if (oo.after) oo.after = Math.round(oo.after * afterScale);
+    if (oo.before) oo.before = Math.round(oo.before * afterScale);
+    x += wPara(xml, oo);
+    est += paraHeight(widthPt, maxSize, oo);
+  }
+
   // 页眉（有姓名就打印姓名，没有就留空供手写）
   const who = (essay.identity && essay.identity.name) || '';
-  x += wPara(
-    wRun('英语作文批改报告', { head: true, bold: true, size: 24 }) +
-    wRun('　　　　编号：' + essay.no + ' 号　　姓名：', { size: 19 }) +
-    (who ? wRun(who, { size: 19, bold: true }) : wRun('　　　　　', { size: 19, underline: true })),
-    { align: 'center', after: 40 }
-  );
-  x += wPara(wRun('', {}), { border: '2563EB', after: 120 });
+  const header = [
+    { text: '英语作文批改报告', head: true, bold: true, size: S.headTitle },
+    { text: '　　　　编号：' + essay.no + ' 号　　姓名：', size: S.name }
+  ];
+  if (who) header.push({ text: who, size: S.name, bold: true });
+  else header.push({ text: '　　　　　', size: S.name, underline: true });
+  add(header, { align: 'center', after: 40 });
+  add([{ text: '', size: S.body }], { border: '2563EB', after: 120 });
 
   // 题目
-  x += wPara(
-    wRun('作文题目：', { head: true, bold: true, size: 20 }) + wRun(batch.title || '—', { size: 20 }),
-    { after: 60 }
-  );
+  add([
+    { text: '作文题目：', head: true, bold: true, size: S.label },
+    { text: clipText(batch.title || '—', lim.titleChars), size: S.label }
+  ], { after: 60 });
 
   // 得分
-  x += wPara(
-    wRun('得分：', { head: true, bold: true, size: 20 }) +
-    wRun(String(score), { head: true, bold: true, size: 32, color: '2563EB' }) +
-    wRun(' / 25　　', { size: 20 }) +
-    wRun('档次：' + tier, { head: true, bold: true, size: 22, color: 'F97316' }),
-    { after: 80 }
-  );
+  add([
+    { text: '得分：', head: true, bold: true, size: S.label },
+    { text: String(score), head: true, bold: true, size: S.score, color: '2563EB' },
+    { text: ' / 25　　', size: S.label },
+    { text: '档次：' + tier, head: true, bold: true, size: S.tier, color: 'F97316' }
+  ], { after: 80 });
 
   // 四维度
   if (valid) {
-    x += wPara(
-      wRun('内容 ' + (d.content ?? '—') + '/10　　语言 ' + (d.language ?? '—') + '/10　　结构 ' +
+    add([{
+      text: '内容 ' + (d.content ?? '—') + '/10　　语言 ' + (d.language ?? '—') + '/10　　结构 ' +
         (d.structure ?? '—') + '/3　　书写 ' + (d.handwriting ?? '—') + '/2' +
-        (r.wordCount ? '　　词数 ' + r.wordCount : ''), { size: 19, color: '475569' }),
-      { after: 110 }
-    );
+        (r.wordCount ? '　　词数 ' + r.wordCount : ''),
+      size: S.dim, color: '475569'
+    }], { after: 110 });
     // 这张纸是要发给学生的，四维加起来必须对得上总分
     const gap = scoreGapOf(r);
     if (gap !== 0) {
-      x += wPara(
-        wRun('四维合计 ' + dimensionTotal(r) + ' 分' +
+      add([{
+        text: '四维合计 ' + dimensionTotal(r) + ' 分' +
           (gap < 0 ? '，硬性扣分 ' + Math.abs(gap) + ' 分' : '，上调 ' + gap + ' 分') +
-          '，最终得分 ' + r.score + ' 分', { size: 18, color: '475569' }),
-        { after: 110 }
-      );
+          '，最终得分 ' + r.score + ' 分',
+        size: S.gapNote, color: '475569'
+      }], { after: 110 });
     }
   }
 
   // 要点核对
   if (pts.length) {
-    x += wPara(wRun(nextSec() + '写作要点核对', { head: true, bold: true, size: 20 }), { after: 30 });
+    add([{ text: nextSec() + '写作要点核对', head: true, bold: true, size: S.section }], { after: 30 });
     pts.forEach(function (p) {
-      x += wPara(
-        wRun(p.covered ? '【已写】' : '【漏写】', { size: 19, bold: !p.covered, color: p.covered ? '059669' : 'DC2626' }) +
-        wRun(' ' + p.point + (p.note ? '　—— ' + p.note : ''), { size: 19 }),
-        { after: 20, indent: 200 }
-      );
+      add([
+        { text: p.covered ? '【已写】' : '【漏写】', size: S.body, bold: !p.covered, color: p.covered ? '059669' : 'DC2626' },
+        { text: ' ' + clipText(p.point, lim.pointChars) + (!lim.omitPointNote && p.note ? '　—— ' + p.note : ''), size: S.body }
+      ], { after: 20, indent: 200 });
     });
-    x += wPara(wRun('', {}), { after: 50 });
+    add([{ text: '', size: S.body }], { after: 50 });
   }
 
   // 逐句纠错（三档及以上才有，来自 AI 初评的详细标注）
-  const errors = (essay.ai && essay.ai.errors) || [];
+  const errLimit = lim.errors == null ? Infinity : lim.errors;
+  const errors = ((essay.ai && essay.ai.errors) || []).slice(0, errLimit);
   if (errors.length) {
-    x += wPara(wRun(nextSec() + '逐句纠错', { head: true, bold: true, size: 20 }), { after: 30 });
+    add([{ text: nextSec() + '逐句纠错', head: true, bold: true, size: S.section }], { after: 30 });
     errors.forEach(function (er, i) {
       let line = (i + 1) + '. ' + (er.text || '');
       if (er.fix) line += '　→　' + er.fix;
       if (er.type) line += '　（' + er.type + '）';
       if (er.note) line += '　—— ' + er.note;
-      x += wPara(wRun(line, { size: 19 }), { after: 20, indent: 200 });
+      add([{ text: line, size: S.body }], { after: 20, indent: 200 });
     });
-    x += wPara(wRun('', {}), { after: 50 });
+    add([{ text: '', size: S.body }], { after: 50 });
   }
 
   // 需要改进的地方
-  if (valid && r.problems && r.problems.length) {
-    x += wPara(wRun(nextSec() + '需要改进的地方', { head: true, bold: true, size: 20 }), { after: 30 });
-    r.problems.slice(0, 3).forEach(function (p, i) {
-      x += wPara(wRun((i + 1) + '. ' + p, { size: 19 }), { after: 20, indent: 200 });
+  const problems = (valid && r.problems) ? r.problems.slice(0, lim.problems == null ? 3 : lim.problems) : [];
+  if (problems.length) {
+    add([{ text: nextSec() + '需要改进的地方', head: true, bold: true, size: S.section }], { after: 30 });
+    problems.forEach(function (p, i) {
+      add([{ text: (i + 1) + '. ' + clipText(p, lim.problemChars), size: S.body }], { after: 20, indent: 200 });
     });
-    x += wPara(wRun('', {}), { after: 50 });
+    add([{ text: '', size: S.body }], { after: 50 });
   }
 
   // 怎么提高
-  if (valid && r.suggestions && r.suggestions.length) {
-    x += wPara(wRun(nextSec() + '怎么提高', { head: true, bold: true, size: 20 }), { after: 30 });
-    r.suggestions.slice(0, 3).forEach(function (s, i) {
-      x += wPara(wRun((i + 1) + '. ' + s, { size: 19 }), { after: 20, indent: 200 });
+  const suggestions = (valid && r.suggestions) ? r.suggestions.slice(0, lim.suggestions == null ? 3 : lim.suggestions) : [];
+  if (suggestions.length) {
+    add([{ text: nextSec() + '怎么提高', head: true, bold: true, size: S.section }], { after: 30 });
+    suggestions.forEach(function (s, i) {
+      add([{ text: (i + 1) + '. ' + clipText(s, lim.suggestionChars), size: S.body }], { after: 20, indent: 200 });
     });
-    x += wPara(wRun('', {}), { after: 50 });
+    add([{ text: '', size: S.body }], { after: 50 });
   }
 
   // 评语：教师复核过叫「老师评语」，否则是 AI 初评，如实标成「AI 评语」
   if (valid && r.comment) {
-    x += wPara(wRun(nextSec() + (essay.reviewed ? '老师评语' : 'AI 评语'), { head: true, bold: true, size: 20 }), { after: 30 });
-    x += wPara(wRun(r.comment, { size: 19 }), { after: 100, indent: 200, shade: 'F3F7FF' });
+    add([{ text: nextSec() + (essay.reviewed ? '老师评语' : 'AI 评语'), head: true, bold: true, size: S.section }], { after: 30 });
+    add([{ text: clipText(r.comment, lim.commentChars), size: S.body }], { after: 100, indent: 200, shade: 'F3F7FF' });
   }
 
-  // 范文
-  const modelText = (essayRes && essayRes.text) || (valid && r.modelEssay) || '';
-  x += wPara(wRun(nextSec() + '为你改写的范文（照着读三遍，把好句子抄下来）', { head: true, bold: true, size: 20 }), { after: 30 });
+  // 范文（优先级见 effectiveModelEssay：essayMap 里传进来的已是统一口径后的文本）
+  const modelRaw = (essayRes && essayRes.text) || '';
+  const modelText = clipText(modelRaw, lim.modelChars);
+  add([{ text: nextSec() + '为你改写的范文（照着读三遍，把好句子抄下来）', head: true, bold: true, size: S.section }], { after: 30 });
   if (modelText) {
     modelText.split(/\n+/).forEach(function (seg) {
-      if (seg.trim()) x += wPara(wRun(seg.trim(), { size: 20 }), { after: 40, indent: 200 });
+      if (seg.trim()) add([{ text: seg.trim(), size: S.model }], { after: 40, indent: 200 });
     });
-    if (essayRes && essayRes.notes && essayRes.notes.length) {
-      x += wPara(wRun('为什么这样改：', { head: true, bold: true, size: 19 }), { after: 20 });
-      essayRes.notes.slice(0, 2).forEach(function (n, i) {
-        x += wPara(wRun((i + 1) + '. ' + n, { size: 18, color: '475569' }), { after: 18, indent: 200 });
+    const notes = (essayRes && essayRes.notes) ? essayRes.notes.slice(0, lim.notes == null ? 2 : lim.notes) : [];
+    if (notes.length) {
+      add([{ text: '为什么这样改：', head: true, bold: true, size: S.noteHead }], { after: 20 });
+      notes.forEach(function (n, i) {
+        add([{ text: (i + 1) + '. ' + n, size: S.note, color: '475569' }], { after: 18, indent: 200 });
       });
     }
-    if (essayRes && essayRes.keyPhrases && essayRes.keyPhrases.length) {
-      x += wPara(wRun('背下来能加分的好词好句：', { head: true, bold: true, size: 19 }), { after: 20 });
-      essayRes.keyPhrases.slice(0, 4).forEach(function (k) {
-        x += wPara(wRun('· ' + k, { size: 18, color: '1D4ED8' }), { after: 18, indent: 200 });
+    const keys = (essayRes && essayRes.keyPhrases) ? essayRes.keyPhrases.slice(0, lim.keys == null ? 4 : lim.keys) : [];
+    if (keys.length) {
+      add([{ text: '背下来能加分的好词好句：', head: true, bold: true, size: S.noteHead }], { after: 20 });
+      keys.forEach(function (k) {
+        add([{ text: '· ' + k, size: S.key, color: '1D4ED8' }], { after: 18, indent: 200 });
       });
     }
   } else {
-    x += wPara(wRun('（本篇尚未生成范文。请在平台里点「生成范文」，然后重新导出。）', { size: 18, color: '94A3B8' }),
+    add([{ text: '（本篇尚未生成范文。请在平台里点「生成范文」，然后重新导出。）', size: S.placeholder, color: '94A3B8' }],
       { after: 100, indent: 200 });
   }
 
-  return x;
+  return { xml: x, height: est };
+}
+
+/* 从最宽松的版式开始试，选第一个估算不超过一页的；
+   最紧凑一档对题目/要点/问题/建议/评语/范文都做了硬上限，保证一定装进一页。 */
+function fitStudentPage(batch, essay, r, essayRes, index) {
+  let last = null;
+  for (let i = 0; i < FIT_PRESETS.length; i++) {
+    last = buildStudentPage(batch, essay, r, essayRes, index, FIT_PRESETS[i]);
+    if (last.height <= FIT_LIMIT_TW) return last;
+  }
+  return last;
 }
 
 function buildReportDocx(batch, essays, essayMap) {
@@ -1487,7 +2031,7 @@ function buildReportDocx(batch, essays, essayMap) {
   essays.forEach(function (e, i) {
     const r = eff(e);
     if (i > 0) body += pageBreak();
-    body += buildStudentPage(batch, e, r, essayMap[e.id], i);
+    body += fitStudentPage(batch, e, r, essayMap[e.id], i).xml;
   });
   if (!essays.length) body = wPara(wRun('本批次没有可导出的作文。', { size: 22 }));
   return buildDocx(body);
@@ -1497,6 +2041,16 @@ function buildReportDocx(batch, essays, essayMap) {
 function eff(e) {
   if (e.review && e.review.confirmed) return e.review;
   return e.ai || null;
+}
+
+/* 有效范文：教师复核里改过的优先（老师拍板的为准），其次「生成范文」单独生成的
+   结果，最后批改时一并生成的那份。导出报告与档案详情都用这一个口径，
+   三处不再各说各话 —— 否则老师在复核表单里改的范文，导出时会被旧结果顶掉。 */
+function effectiveModelEssay(e) {
+  const r = eff(e);
+  if (e.reviewed && r && r.modelEssay && String(r.modelEssay).trim()) return String(r.modelEssay);
+  if (e.modelEssayRes && e.modelEssayRes.text && String(e.modelEssayRes.text).trim()) return String(e.modelEssayRes.text);
+  return String((r && r.modelEssay) || '');
 }
 
 /* 是否有可用的批改结果（既要有结果，又不能是空模板） */
@@ -1518,6 +2072,7 @@ const MIME = {
   '.png': 'image/png',
   '.jpg': 'image/jpeg',
   '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
   '.ico': 'image/x-icon'
 };
 
@@ -1545,7 +2100,11 @@ function readBody(req, limit = 30 * 1024 * 1024) {
 }
 
 function csvCell(v) {
-  const s = v === null || v === undefined ? '' : String(v);
+  let s = v === null || v === undefined ? '' : String(v);
+  // Excel / WPS 公式注入防护：以 = + - @ 开头的单元格会被表格软件当公式执行
+  // （如 =HYPERLINK(...)），前面补一个半角单引号把它固定成文本。
+  // 正常数据（中文姓名、数字得分）不会以这四个字符开头，不受影响。
+  if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
   return '"' + s.replace(/"/g, '""').replace(/\r?\n/g, ' ') + '"';
 }
 
@@ -1584,10 +2143,13 @@ async function serveUpload(req, res, pathname) {
 async function removeFiles(essays) {
   let failed = 0;
   for (const e of essays) {
-    try {
-      await fsp.unlink(path.join(UPLOAD_DIR, e.file));
-    } catch (err) {
-      if (err.code !== 'ENOENT') failed++;
+    const files = [e.file, e.identityShot].filter(Boolean);
+    for (const f of files) {
+      try {
+        await fsp.unlink(path.join(UPLOAD_DIR, f));
+      } catch (err) {
+        if (err.code !== 'ENOENT') failed++;
+      }
     }
   }
   return failed;
@@ -1694,7 +2256,10 @@ async function handleApi(req, res, pathname, query) {
       return sendJson(res, 200, { ok: true, reply: String(reply).slice(0, 100) });
     } catch (e) {
       clearTimeout(timer);
-      return sendJson(res, 200, { ok: false, error: '请求失败：' + (e && e.message ? e.message : e) });
+      const msg = (e && e.name === 'AbortError')
+        ? '请求超时（45 秒内没有返回），接口可能不通或网络受限'
+        : '请求失败：' + (e && e.message ? e.message : e);
+      return sendJson(res, 200, { ok: false, error: msg });
     }
   }
 
@@ -1717,40 +2282,43 @@ async function handleApi(req, res, pathname, query) {
 
   /* ---- 新建批次 ---- */
   if (pathname === '/api/batch/create') {
-    const db = await loadDb();
-    const b = {
-      id: uid('b_'),
-      title: String(body.title || '').trim() || '未命名作文题',
-      className: String(body.className || '').trim(),
-      points: (Array.isArray(body.points) ? body.points : []).map((s) => String(s).trim()).filter(Boolean),
-      createdAt: new Date().toISOString(),
-      essays: []
-    };
-    db.batches.unshift(b);
-    await writeJson(DB_FILE, db);
-    return sendJson(res, 200, { ok: true, batch: b });
+    return await withData(async function () {
+      const db = await loadDb();
+      const b = {
+        id: uid('b_'),
+        title: String(body.title || '').trim() || '未命名作文题',
+        className: String(body.className || '').trim(),
+        points: (Array.isArray(body.points) ? body.points : []).map((s) => String(s).trim()).filter(Boolean),
+        createdAt: new Date().toISOString(),
+        essays: []
+      };
+      db.batches.unshift(b);
+      await writeJson(DB_FILE, db);
+      return sendJson(res, 200, { ok: true, batch: b });
+    });
   }
 
-  /* ---- 读取批次详情 ---- */
   /* ---- 修改批次（题目 / 默认班级 / 核心要点） ---- */
   if (pathname === '/api/batch/update') {
-    const db = await loadDb();
-    const b = findBatch(db, body.id);
-    if (!b) return sendJson(res, 404, { ok: false, error: '批次不存在' });
-    if (body.title !== undefined) {
-      b.title = String(body.title).trim() || '未命名作文题';
-    }
-    if (body.className !== undefined) {
-      // 只改「批次默认班级」。已批改的作文各自记着卷面上写出的班级，不会跟着变
-      // （一个批次里混了几个班的卷子时，批次班级本来就只是个默认值）。
-      b.className = String(body.className).trim();
-    }
-    if (Array.isArray(body.points)) {
-      b.points = body.points.map((s) => String(s).trim()).filter(Boolean);
-    }
-    b.updatedAt = new Date().toISOString();
-    await writeJson(DB_FILE, db);
-    return sendJson(res, 200, { ok: true, batch: b });
+    return await withData(async function () {
+      const db = await loadDb();
+      const b = findBatch(db, body.id);
+      if (!b) return sendJson(res, 404, { ok: false, error: '批次不存在' });
+      if (body.title !== undefined) {
+        b.title = String(body.title).trim() || '未命名作文题';
+      }
+      if (body.className !== undefined) {
+        // 只改「批次默认班级」。已批改的作文各自记着卷面上写出的班级，不会跟着变
+        // （一个批次里混了几个班的卷子时，批次班级本来就只是个默认值）。
+        b.className = String(body.className).trim();
+      }
+      if (Array.isArray(body.points)) {
+        b.points = body.points.map((s) => String(s).trim()).filter(Boolean);
+      }
+      b.updatedAt = new Date().toISOString();
+      await writeJson(DB_FILE, db);
+      return sendJson(res, 200, { ok: true, batch: b });
+    });
   }
 
   /* ---- 读取批次详情 ---- */
@@ -1763,51 +2331,70 @@ async function handleApi(req, res, pathname, query) {
 
   /* ---- 删除批次 ---- */
   if (pathname === '/api/batch/delete') {
-    const db = await loadDb();
-    const i = db.batches.findIndex((b) => b.id === body.id);
-    if (i === -1) return sendJson(res, 404, { ok: false, error: '批次不存在' });
-    // 删除前留一份快照：误删整批（含照片）时至少记录还能找回
-    const snap = await safeSnapshot(DB_FILE, 'db', {});
-    const failed = await removeFiles(db.batches[i].essays);
-    db.batches.splice(i, 1);
-    await writeJson(DB_FILE, db);
-    return sendJson(res, 200, { ok: true, cleanupFailed: failed, uploadDir: UPLOAD_DIR, snapshot: snap });
+    return await withData(async function () {
+      const db = await loadDb();
+      const i = db.batches.findIndex((b) => b.id === body.id);
+      if (i === -1) return sendJson(res, 404, { ok: false, error: '批次不存在' });
+      // 删除前留一份快照：误删整批（含照片）时至少记录还能找回
+      const snap = await safeSnapshot(DB_FILE, 'db', {});
+      const failed = await removeFiles(db.batches[i].essays);
+      db.batches.splice(i, 1);
+      await writeJson(DB_FILE, db);
+      return sendJson(res, 200, { ok: true, cleanupFailed: failed, uploadDir: UPLOAD_DIR, snapshot: snap });
+    });
   }
 
   /* ---- 上传照片（base64） ---- */
   if (pathname === '/api/upload') {
-    const db = await loadDb();
-    const b = findBatch(db, body.batchId);
-    if (!b) return sendJson(res, 404, { ok: false, error: '批次不存在' });
-    const m = /^data:(image\/[a-zA-Z+]+);base64,(.+)$/s.exec(String(body.dataUrl || ''));
-    if (!m) return sendJson(res, 400, { ok: false, error: '图片格式不正确' });
-    const ext = m[1] === 'image/png' ? '.png' : (m[1] === 'image/webp' ? '.webp' : '.jpg');
-    const id = uid('e_');
-    const file = id + ext;
-    await fsp.writeFile(path.join(UPLOAD_DIR, file), Buffer.from(m[2], 'base64'));
-    // 文件名里带姓名就先填上（教师自己的名单）。批改时模型识别到的班级 / 学号会补进空着的字段，
-    // 教师手工改过的（source = manual）不会被任何环节覆盖。
-    const fromName = nameFromFileName(body.name);
-    const essay = {
-      id,
-      no: b.essays.length + 1,
-      file,
-      mime: m[1],
-      originalName: String(body.name || ''),
-      createdAt: new Date().toISOString(),
-      status: 'pending',
-      identity: fromName
-        ? { name: fromName, className: '', seatNo: '', source: 'filename', updatedAt: new Date().toISOString() }
-        : null,
-      ai: null,
-      aiRaw: '',
-      aiError: '',
-      review: null,
-      reviewed: false
-    };
-    b.essays.push(essay);
-    await writeJson(DB_FILE, db);
-    return sendJson(res, 200, { ok: true, essay });
+    return await withData(async function () {
+      const db = await loadDb();
+      const b = findBatch(db, body.batchId);
+      if (!b) return sendJson(res, 404, { ok: false, error: '批次不存在' });
+      const m = /^data:(image\/[a-zA-Z+]+);base64,(.+)$/s.exec(String(body.dataUrl || ''));
+      if (!m) return sendJson(res, 400, { ok: false, error: '图片格式不正确' });
+      const ext = m[1] === 'image/png' ? '.png' : (m[1] === 'image/webp' ? '.webp' : '.jpg');
+      const id = uid('e_');
+      const file = id + ext;
+      await fsp.writeFile(path.join(UPLOAD_DIR, file), Buffer.from(m[2], 'base64'));
+      // 卷首放大图（前端裁好一起传上来）：小字手写姓名单独认一次，比整页照片认小字准得多。
+      // 存成独立文件而不是只留在内存里，是为了教师事后点「识别姓名」时还能用。
+      let identityShot = '';
+      const sm = /^data:image\/[a-zA-Z+]+;base64,(.+)$/s.exec(String(body.shot || ''));
+      if (sm) {
+        identityShot = id + '_id.jpg';
+        try {
+          await fsp.writeFile(path.join(UPLOAD_DIR, identityShot), Buffer.from(sm[1], 'base64'));
+        } catch (e) { identityShot = ''; }
+      }
+      // 文件名里带姓名就先填上（教师自己的名单）。批改时模型识别到的班级 / 学号会补进空着的字段，
+      // 教师手工改过的（source = manual）不会被任何环节覆盖。
+      const fromName = nameFromFileName(body.name);
+      // 编号取「当前最大编号 + 1」。不能用 essays.length + 1：删掉中间一篇后
+      // 长度会缩回去，再上传就会和现存作文撞号，登分表按编号对卷子会认错人。
+      let maxNo = 0;
+      b.essays.forEach(function (x) { if ((x.no || 0) > maxNo) maxNo = x.no; });
+      const essay = {
+        id,
+        no: maxNo + 1,
+        file,
+        identityShot,
+        mime: m[1],
+        originalName: String(body.name || ''),
+        createdAt: new Date().toISOString(),
+        status: 'pending',
+        identity: fromName
+          ? { name: fromName, className: '', seatNo: '', source: 'filename', updatedAt: new Date().toISOString() }
+          : null,
+        ai: null,
+        aiRaw: '',
+        aiError: '',
+        review: null,
+        reviewed: false
+      };
+      b.essays.push(essay);
+      await writeJson(DB_FILE, db);
+      return sendJson(res, 200, { ok: true, essay });
+    });
   }
 
   /* ---- 批改一篇 ---- */
@@ -1817,100 +2404,132 @@ async function handleApi(req, res, pathname, query) {
     if (!settings.baseUrl || !settings.model) return sendJson(res, 400, { ok: false, error: '尚未配置接口地址或模型名称' });
     const prompt = await fsp.readFile(PROMPT_FILE, 'utf8').catch(() => DEFAULT_PROMPT);
 
-    const db = await loadDb();
-    const b = findBatch(db, body.batchId);
-    if (!b) return sendJson(res, 404, { ok: false, error: '批次不存在' });
-    const e = b.essays.find((x) => x.id === body.essayId);
-    if (!e) return sendJson(res, 404, { ok: false, error: '作文记录不存在' });
+    // 先做只读预检（拿批改要用的题目与作文），404 在这里就能返回；
+    // 真正的落库都在下面的锁内重新读、重新找 —— 预检和落库之间批次/作文可能已被删除。
+    const db0 = await loadDb();
+    const b0 = findBatch(db0, body.batchId);
+    if (!b0) return sendJson(res, 404, { ok: false, error: '批次不存在' });
+    const e0 = b0.essays.find((x) => x.id === body.essayId);
+    if (!e0) return sendJson(res, 404, { ok: false, error: '作文记录不存在' });
 
-    e.status = 'grading';
-    await writeJson(DB_FILE, db);
+    await withData(async function () {
+      const db = await loadDb();
+      const b = findBatch(db, body.batchId);
+      const e = b && b.essays.find((x) => x.id === body.essayId);
+      if (b && e) {
+        e.status = 'grading';
+        await writeJson(DB_FILE, db);
+      }
+    });
 
     try {
-      const r = await callModel(settings, prompt, b, e);
-      const db2 = await loadDb();
-      const b2 = findBatch(db2, body.batchId);
-      const e2 = b2.essays.find((x) => x.id === body.essayId);
-      if (r.ok) {
-        e2.ai = r.result;
-        e2.aiRaw = '';
-        e2.aiError = '';
-        e2.status = 'done';
-
-        // 卷面识别到的学生信息：
-        //  · 教师手工填过（manual）→ 一个字都不动
-        //  · 其它来源（文件名兜底 / 上一次识别）→ 只补空着的字段，已有的值不被覆盖。
-        //    模型偶尔认不出卷面小字（尤其竖排在装订线上的），整份覆盖会把文件名带来的姓名也清掉。
-        const si = r.result.studentInfo || {};
-        const cur = e2.identity || {};
-        if (cur.source !== 'manual') {
-          const pick = (first, second) => String(first || '').trim() || String(second || '').trim();
-          // 姓名：文件名（教师自己的名单）优先，它是姓名最可靠的来源
-          const name = pick(cur.name, si.name);
-          // 班级 / 学号：以本次识别为准。旧数据里存过「教师后台班级」被回填进来的值，
-          // 若让旧值优先，重新批改也改不掉那个错误的班级。
-          const className = pick(si.className, cur.className);
-          const seatNo = pick(si.seatNo, cur.seatNo);
-          const any = name || className || seatNo;
-          // source 只记「姓名」的出处：教师一眼能看出这个名字是手填的、文件名带出来的，还是认出来的
-          let source = 'none';
-          if (any) {
-            source = cur.name ? (cur.source || 'ai') : 'ai';
-            if (source === 'none') source = 'ai';
-          }
-          e2.identity = { name: name, className: className, seatNo: seatNo, source: source, updatedAt: new Date().toISOString() };
+      // 模型调用可能要几十秒，必须放在锁外，否则会挡住其它所有写库操作
+      const r = await callModel(settings, prompt, b0, e0);
+      return await withData(async function () {
+        const db2 = await loadDb();
+        const b2 = findBatch(db2, body.batchId);
+        const e2 = b2 && b2.essays.find((x) => x.id === body.essayId);
+        if (!b2 || !e2) {
+          return sendJson(res, 200, { ok: false, error: '批改已完成，但这篇作文或所在批次已被删除，结果未能保存。', essay: null });
         }
-        // 作文标识（标题 + 正文首句），每次批改刷新
-        e2.identifier = {
-          title: r.result.essayTitle || '',
-          firstSentence: r.result.firstSentence || ''
-        };
-        // 归入学生档案（有姓名才归）
-        e2.studentId = (e2.identity && e2.identity.name) ? await resolveStudent(b2, e2.identity) : '';
-      } else {
-        e2.status = 'error';
-        e2.aiError = r.reason || '解析失败';
-        e2.aiRaw = r.raw || '';
-      }
-      await writeJson(DB_FILE, db2);
-      return sendJson(res, 200, { ok: true, essay: e2 });
+        if (r.ok) {
+          e2.ai = r.result;
+          e2.aiRaw = '';
+          e2.aiError = '';
+          e2.status = 'done';
+
+          // 卷面识别到的学生信息：
+          //  · 教师手工填过（manual）→ 一个字都不动
+          //  · 其它来源（文件名兜底 / 上一次识别）→ 只补空着的字段，已有的值不被覆盖。
+          //    模型偶尔认不出卷面小字（尤其竖排在装订线上的），整份覆盖会把文件名带来的姓名也清掉。
+          const si = r.result.studentInfo || {};
+          const cur = e2.identity || {};
+          if (cur.source !== 'manual') {
+            const pick = (first, second) => String(first || '').trim() || String(second || '').trim();
+            // 姓名：文件名（教师自己的名单）优先，它是姓名最可靠的来源
+            const name = pick(cur.name, si.name);
+            // 班级 / 学号：以本次识别为准。旧数据里存过「教师后台班级」被回填进来的值，
+            // 若让旧值优先，重新批改也改不掉那个错误的班级。
+            const className = pick(si.className, cur.className);
+            const seatNo = pick(si.seatNo, cur.seatNo);
+            const any = name || className || seatNo;
+            // source 只记「姓名」的出处：教师一眼能看出这个名字是手填的、文件名带出来的，还是认出来的
+            let source = 'none';
+            if (any) {
+              source = cur.name ? (cur.source || 'ai') : 'ai';
+              if (source === 'none') source = 'ai';
+            }
+            e2.identity = { name: name, className: className, seatNo: seatNo, source: source, updatedAt: new Date().toISOString() };
+          }
+          // 作文标识（标题 + 正文首句），每次批改刷新
+          e2.identifier = {
+            title: r.result.essayTitle || '',
+            firstSentence: r.result.firstSentence || ''
+          };
+          // 卷面姓名没认出来时，再单独跑一次「卷首放大图」识别，并用班级名单核定。
+          // 姓名认错会把 A 的成绩记到 B 头上，值得多花这一次图片请求；认出来了就不重复花钱。
+          if (!((e2.identity || {}).name) && e2.identityShot && settings.apiKey) {
+            try {
+              const sc = await readEssayIdentity(settings, b2, e2);
+              if (sc.ok) applyIdentityScan(e2, sc.merged, sc.read, false);
+            } catch (err) { /* 姓名识别失败不影响批改结果 */ }
+          }
+          // 归入学生档案（有姓名才归）
+          e2.studentId = (e2.identity && e2.identity.name) ? await resolveStudent(b2, e2.identity) : '';
+        } else {
+          e2.status = 'error';
+          e2.aiError = r.reason || '解析失败';
+          e2.aiRaw = r.raw || '';
+        }
+        await writeJson(DB_FILE, db2);
+        return sendJson(res, 200, { ok: true, essay: e2 });
+      });
     } catch (err) {
-      const db2 = await loadDb();
-      const b2 = findBatch(db2, body.batchId);
-      const e2 = b2.essays.find((x) => x.id === body.essayId);
-      if (e2) { e2.status = 'error'; e2.aiError = String(err.message || err); }
-      await writeJson(DB_FILE, db2);
-      return sendJson(res, 200, { ok: false, error: String(err.message || err), essay: e2 });
+      return await withData(async function () {
+        const db2 = await loadDb();
+        const b2 = findBatch(db2, body.batchId);
+        const e2 = b2 && b2.essays.find((x) => x.id === body.essayId);
+        if (e2) {
+          e2.status = 'error';
+          e2.aiError = String(err.message || err);
+          await writeJson(DB_FILE, db2);
+        }
+        return sendJson(res, 200, { ok: false, error: String(err.message || err), essay: e2 || null });
+      });
     }
   }
 
   /* ---- 教师复核保存 ---- */
   if (pathname === '/api/review') {
-    const db = await loadDb();
-    const b = findBatch(db, body.batchId);
-    if (!b) return sendJson(res, 404, { ok: false, error: '批次不存在' });
-    const e = b.essays.find((x) => x.id === body.essayId);
-    if (!e) return sendJson(res, 404, { ok: false, error: '作文记录不存在' });
-    e.review = body.review || null;
-    e.reviewed = !!(body.review && body.review.confirmed);
-    await writeJson(DB_FILE, db);
-    return sendJson(res, 200, { ok: true, essay: e });
+    return await withData(async function () {
+      const db = await loadDb();
+      const b = findBatch(db, body.batchId);
+      if (!b) return sendJson(res, 404, { ok: false, error: '批次不存在' });
+      const e = b.essays.find((x) => x.id === body.essayId);
+      if (!e) return sendJson(res, 404, { ok: false, error: '作文记录不存在' });
+      e.review = body.review || null;
+      e.reviewed = !!(body.review && body.review.confirmed);
+      await writeJson(DB_FILE, db);
+      return sendJson(res, 200, { ok: true, essay: e });
+    });
   }
 
   /* ---- 删除单篇 ---- */
   if (pathname === '/api/essay/delete') {
-    const db = await loadDb();
-    const b = findBatch(db, body.batchId);
-    if (!b) return sendJson(res, 404, { ok: false, error: '批次不存在' });
-    const i = b.essays.findIndex((x) => x.id === body.essayId);
-    let failed = 0;
-    if (i > -1) {
-      await safeSnapshot(DB_FILE, 'db', {});
-      failed = await removeFiles([b.essays[i]]);
-      b.essays.splice(i, 1);
-    }
-    await writeJson(DB_FILE, db);
-    return sendJson(res, 200, { ok: true, cleanupFailed: failed, uploadDir: UPLOAD_DIR });
+    return await withData(async function () {
+      const db = await loadDb();
+      const b = findBatch(db, body.batchId);
+      if (!b) return sendJson(res, 404, { ok: false, error: '批次不存在' });
+      const i = b.essays.findIndex((x) => x.id === body.essayId);
+      let failed = 0;
+      if (i > -1) {
+        await safeSnapshot(DB_FILE, 'db', {});
+        failed = await removeFiles([b.essays[i]]);
+        b.essays.splice(i, 1);
+      }
+      await writeJson(DB_FILE, db);
+      return sendJson(res, 200, { ok: true, cleanupFailed: failed, uploadDir: UPLOAD_DIR });
+    });
   }
 
   /* ---- 为某一篇生成优化范文 ---- */
@@ -1919,21 +2538,26 @@ async function handleApi(req, res, pathname, query) {
     if (!settings.apiKey || !settings.apiKey.trim()) {
       return sendJson(res, 200, { ok: false, error: '尚未配置 API Key，请到「设置」填写' });
     }
-    const db = await loadDb();
-    const b = findBatch(db, body.batchId);
-    if (!b) return sendJson(res, 404, { ok: false, error: '批次不存在' });
-    const e = b.essays.find((x) => x.id === body.essayId);
-    if (!e) return sendJson(res, 404, { ok: false, error: '作文记录不存在' });
+    const db0 = await loadDb();
+    const b0 = findBatch(db0, body.batchId);
+    if (!b0) return sendJson(res, 404, { ok: false, error: '批次不存在' });
+    const e0 = b0.essays.find((x) => x.id === body.essayId);
+    if (!e0) return sendJson(res, 404, { ok: false, error: '作文记录不存在' });
 
     try {
-      const r = await callModelForEssay(settings, b, e, eff(e));
+      const r = await callModelForEssay(settings, b0, e0, eff(e0));
       if (!r.ok) return sendJson(res, 200, { ok: false, error: r.reason, raw: r.raw });
-      const db2 = await loadDb();
-      const b2 = findBatch(db2, body.batchId);
-      const e2 = b2.essays.find((x) => x.id === body.essayId);
-      e2.modelEssayRes = Object.assign({}, r.result, { createdAt: new Date().toISOString() });
-      await writeJson(DB_FILE, db2);
-      return sendJson(res, 200, { ok: true, essay: e2 });
+      return await withData(async function () {
+        const db2 = await loadDb();
+        const b2 = findBatch(db2, body.batchId);
+        const e2 = b2 && b2.essays.find((x) => x.id === body.essayId);
+        if (!b2 || !e2) {
+          return sendJson(res, 200, { ok: false, error: '范文已生成，但这篇作文或所在批次已被删除，结果未能保存。' });
+        }
+        e2.modelEssayRes = Object.assign({}, r.result, { createdAt: new Date().toISOString() });
+        await writeJson(DB_FILE, db2);
+        return sendJson(res, 200, { ok: true, essay: e2 });
+      });
     } catch (err) {
       return sendJson(res, 200, { ok: false, error: String(err.message || err) });
     }
@@ -1941,73 +2565,92 @@ async function handleApi(req, res, pathname, query) {
 
   /* ---- 本地补录作文标识（不调 AI，零成本） ---- */
   if (pathname === '/api/backfill') {
-    const db = await loadDb();
-    const b = findBatch(db, body.batchId);
-    if (!b) return sendJson(res, 404, { ok: false, error: '批次不存在' });
-    let filled = 0;
-    b.essays.forEach(function (e) {
-      const r = e.ai || {};
-      const idf = e.identifier || {};
-      if ((idf.title || idf.firstSentence) || !r.transcription) return;
-      const d = deriveIdentifier(r.transcription);
-      if (d.title || d.firstSentence) {
-        e.identifier = { title: d.title, firstSentence: d.firstSentence, source: 'derive' };
-        filled++;
-      }
-    });
-    // 顺便补全 identity 占位，让前台区分「从未识别」和「识别了但没写」
-    b.essays.forEach(function (e) {
-      if (!e.identity && (e.ai || e.review)) e.identity = { name: '', className: '', seatNo: '', source: 'none' };
-    });
-    // 再补姓名：早先版本上传时没有从文件名取姓名，老数据这里补上（教师手填过的不动，
-    // 已经认出姓名的不动）。文件名是教师自己的名单，比认卷面上竖排的小字可靠。
-    let named = 0;
-    b.essays.forEach(function (e) {
-      const idt = e.identity || {};
-      if (idt.source === 'manual') return;
-      if (String(idt.name || '').trim()) return;
-      const nm = nameFromFileName(e.originalName);
-      if (!nm) return;
-      e.identity = Object.assign({}, idt, { name: nm, source: 'filename', updatedAt: new Date().toISOString() });
-      named++;
-    });
-    if (filled || named) await writeJson(DB_FILE, db);
-    const rebuilt = await rebuildStudents();
-    return sendJson(res, 200, {
-      ok: true, filled: filled, named: named,
-      students: rebuilt.students, linked: rebuilt.linked
+    return await withData(async function () {
+      const db = await loadDb();
+      const b = findBatch(db, body.batchId);
+      if (!b) return sendJson(res, 404, { ok: false, error: '批次不存在' });
+      let filled = 0;
+      b.essays.forEach(function (e) {
+        const r = e.ai || {};
+        const idf = e.identifier || {};
+        if ((idf.title || idf.firstSentence) || !r.transcription) return;
+        const d = deriveIdentifier(r.transcription);
+        if (d.title || d.firstSentence) {
+          e.identifier = { title: d.title, firstSentence: d.firstSentence, source: 'derive' };
+          filled++;
+        }
+      });
+      // 顺便补全 identity 占位，让前台区分「从未识别」和「识别了但没写」
+      b.essays.forEach(function (e) {
+        if (!e.identity && (e.ai || e.review)) e.identity = { name: '', className: '', seatNo: '', source: 'none' };
+      });
+      // 再补姓名：早先版本上传时没有从文件名取姓名，老数据这里补上（教师手填过的不动，
+      // 已经认出姓名的不动）。文件名是教师自己的名单，比认卷面上竖排的小字可靠。
+      let named = 0;
+      b.essays.forEach(function (e) {
+        const idt = e.identity || {};
+        if (idt.source === 'manual') return;
+        if (String(idt.name || '').trim()) return;
+        const nm = nameFromFileName(e.originalName);
+        if (!nm) return;
+        e.identity = Object.assign({}, idt, { name: nm, source: 'filename', updatedAt: new Date().toISOString() });
+        named++;
+      });
+      // 再有就是「只认出考号/学号、没认出姓名」的：拿班级名单把姓名定下来。
+      // 考号是阿拉伯数字，模型认数字远比认草书汉字准；名单里一个号对一个人，错不了。
+      const rosters = await loadRosters();
+      b.essays.forEach(function (e) {
+        const idt = e.identity || {};
+        if (idt.source === 'manual') return;
+        if (String(idt.name || '').trim()) return;
+        if (!String(idt.seatNo || '').trim()) return;
+        const merged = reconcileWithRoster(rosters, idt.className || b.className || '',
+          { name: '', className: idt.className, seatNo: idt.seatNo, candidates: [] });
+        if (!merged.rosterName) return;
+        e.identity = Object.assign({}, idt, {
+          name: merged.rosterName, source: 'roster', updatedAt: new Date().toISOString()
+        });
+        named++;
+      });
+      if (filled || named) await writeJson(DB_FILE, db);
+      const rebuilt = await rebuildStudents();
+      return sendJson(res, 200, {
+        ok: true, filled: filled, named: named,
+        students: rebuilt.students, linked: rebuilt.linked
+      });
     });
   }
 
   /* ---- 一键填写班级：把班级名批量填到这一批的作文上 ----
      一个批次里混了几个班的卷子时用得上。只填空白的，不会动已经认出来的班级；
-     选「全部改成」才会覆盖。填完照样按「教师填写」之外的来源保留，重新批改时
-     若卷面上识别到班级，仍会以识别结果为准。 */
+     选「全部改成」才会覆盖。重新批改时若卷面上识别到班级，仍会以识别结果为准。 */
   if (pathname === '/api/class/fill') {
-    const db = await loadDb();
-    const b = findBatch(db, body.batchId);
-    if (!b) return sendJson(res, 404, { ok: false, error: '批次不存在' });
-    const cls = String(body.className || '').trim();
-    if (!cls) return sendJson(res, 200, { ok: false, error: '请先填写班级名称' });
-    const all = body.mode === 'all';
-    let filled = 0;
-    b.essays.forEach(function (e) {
-      const idt = e.identity || {};
-      const has = String(idt.className || '').trim();
-      if (!all && has) return;                       // 只填空白
-      if (!all && idt.source === 'manual' && idt.name) return;
-      if (has === cls) return;
-      e.identity = Object.assign({}, idt, {
-        className: cls,
-        updatedAt: new Date().toISOString()
+    return await withData(async function () {
+      const db = await loadDb();
+      const b = findBatch(db, body.batchId);
+      if (!b) return sendJson(res, 404, { ok: false, error: '批次不存在' });
+      const cls = String(body.className || '').trim();
+      if (!cls) return sendJson(res, 200, { ok: false, error: '请先填写班级名称' });
+      const all = body.mode === 'all';
+      let filled = 0;
+      b.essays.forEach(function (e) {
+        const idt = e.identity || {};
+        const has = String(idt.className || '').trim();
+        if (!all && has) return;                       // 只填空白：班级还空着的都要填，
+                                                        // 不看姓名是手填的还是认出来的
+        if (has === cls) return;
+        e.identity = Object.assign({}, idt, {
+          className: cls,
+          updatedAt: new Date().toISOString()
+        });
+        filled++;
       });
-      filled++;
+      if (filled) {
+        await writeJson(DB_FILE, db);
+        await rebuildStudents();       // 班级变了，学生档案的归并键跟着变
+      }
+      return sendJson(res, 200, { ok: true, filled: filled });
     });
-    if (filled) {
-      await writeJson(DB_FILE, db);
-      await rebuildStudents();       // 班级变了，学生档案的归并键跟着变
-    }
-    return sendJson(res, 200, { ok: true, filled: filled });
   }
 
   /* ---- 班级共性分析 + 教学建议（AI 生成，纯文本，成本低） ---- */
@@ -2015,25 +2658,28 @@ async function handleApi(req, res, pathname, query) {
     const settings = Object.assign({}, DEFAULT_SETTINGS, await readJson(SETTINGS_FILE, {}));
     if (!settings.apiKey || !settings.apiKey.trim()) return sendJson(res, 200, { ok: false, error: '尚未配置 API Key，请到「设置」填写' });
     if (!settings.baseUrl || !settings.model) return sendJson(res, 200, { ok: false, error: '尚未配置接口地址或模型名称' });
-    const db = await loadDb();
-    const b = findBatch(db, body.batchId);
-    if (!b) return sendJson(res, 404, { ok: false, error: '批次不存在' });
-    if (!b.essays.some(function (e) { return hasResult(e); })) {
+    const db0 = await loadDb();
+    const b0 = findBatch(db0, body.batchId);
+    if (!b0) return sendJson(res, 404, { ok: false, error: '批次不存在' });
+    if (!b0.essays.some(function (e) { return hasResult(e); })) {
       return sendJson(res, 200, { ok: false, error: '这一批还没有批改结果，先批改完再生成' });
     }
     try {
-      const parsed = await callTextModel(settings, CLASS_PROMPT, buildClassUserText(b));
+      const parsed = await callTextModel(settings, CLASS_PROMPT, buildClassUserText(b0));
       const out = {
         commonStrengths: toStrArr(parsed.commonStrengths || parsed.strengths).slice(0, 2),
         commonProblems: toStrArr(parsed.commonProblems || parsed.issues).slice(0, 4),
         guidance: toStrArr(parsed.guidance || parsed.suggestions || parsed.advice).slice(0, 5),
         createdAt: new Date().toISOString()
       };
-      const db2 = await loadDb();
-      const b2 = findBatch(db2, body.batchId);
-      b2.classAnalysis = out;
-      await writeJson(DB_FILE, db2);
-      return sendJson(res, 200, { ok: true, classAnalysis: out });
+      return await withData(async function () {
+        const db2 = await loadDb();
+        const b2 = findBatch(db2, body.batchId);
+        if (!b2) return sendJson(res, 200, { ok: false, error: '批次已被删除，分析结果未能保存。' });
+        b2.classAnalysis = out;
+        await writeJson(DB_FILE, db2);
+        return sendJson(res, 200, { ok: true, classAnalysis: out });
+      });
     } catch (err) {
       return sendJson(res, 200, { ok: false, error: String(err.message || err) });
     }
@@ -2041,27 +2687,101 @@ async function handleApi(req, res, pathname, query) {
 
   /* ---- 教师订正卷面学生信息 ---- */
   if (pathname === '/api/identity') {
-    const db = await loadDb();
-    const b = findBatch(db, body.batchId);
-    if (!b) return sendJson(res, 404, { ok: false, error: '批次不存在' });
-    const e = b.essays.find((x) => x.id === body.essayId);
-    if (!e) return sendJson(res, 404, { ok: false, error: '作文记录不存在' });
-    const src = body.identity || {};
-    const name = String(src.name || '').trim();
-    const className = String(src.className || '').trim();
-    const seatNo = String(src.seatNo || '').trim();
-    const any = name || className || seatNo;
-    e.identity = {
-      name: name,
-      className: className,
-      seatNo: seatNo,
-      source: any ? 'manual' : 'none',
-      updatedAt: new Date().toISOString()
-    };
-    // 同步进学生档案（跨批次归并）
-    e.studentId = name ? await resolveStudent(b, e.identity) : '';
-    await writeJson(DB_FILE, db);
-    return sendJson(res, 200, { ok: true, essay: e });
+    return await withData(async function () {
+      const db = await loadDb();
+      const b = findBatch(db, body.batchId);
+      if (!b) return sendJson(res, 404, { ok: false, error: '批次不存在' });
+      const e = b.essays.find((x) => x.id === body.essayId);
+      if (!e) return sendJson(res, 404, { ok: false, error: '作文记录不存在' });
+      const src = body.identity || {};
+      const name = String(src.name || '').trim();
+      const className = String(src.className || '').trim();
+      const seatNo = String(src.seatNo || '').trim();
+      const any = name || className || seatNo;
+      e.identity = {
+        name: name,
+        className: className,
+        seatNo: seatNo,
+        source: any ? 'manual' : 'none',
+        updatedAt: new Date().toISOString()
+      };
+      // 教师已经拍板了，之前识别出来的候选就没有用了
+      e.nameCandidates = [];
+      // 同步进学生档案（跨批次归并）
+      e.studentId = name ? await resolveStudent(b, e.identity) : '';
+      await writeJson(DB_FILE, db);
+      return sendJson(res, 200, { ok: true, essay: e });
+    });
+  }
+
+  /* ---- 单独识别一卷的姓名 / 班级 / 考号（卷首放大图 + 班级名单核对） ----
+     批改时若没认出姓名会自动跑一次；教师也可以在详情里点「识别姓名」重跑。
+     传 force: true 表示「以这次识别为准」，连 AI 上一次认出来的姓名也允许改掉。 */
+  if (pathname === '/api/identity/scan') {
+    const settings = Object.assign({}, DEFAULT_SETTINGS, await readJson(SETTINGS_FILE, {}));
+    if (!settings.apiKey || !settings.apiKey.trim()) {
+      return sendJson(res, 200, { ok: false, error: '尚未配置 API Key，请到「设置」填写' });
+    }
+    const db0 = await loadDb();
+    const b0 = findBatch(db0, body.batchId);
+    if (!b0) return sendJson(res, 404, { ok: false, error: '批次不存在' });
+    const e0 = b0.essays.find((x) => x.id === body.essayId);
+    if (!e0) return sendJson(res, 404, { ok: false, error: '作文记录不存在' });
+    try {
+      // 识别（含一次模型请求）在锁外跑，识别完再进锁落库
+      const r = await readEssayIdentity(settings, b0, e0);
+      if (!r.ok) return sendJson(res, 200, { ok: false, error: r.error, raw: r.raw });
+      return await withData(async function () {
+        const db = await loadDb();
+        const b = findBatch(db, body.batchId);
+        const e = b && b.essays.find((x) => x.id === body.essayId);
+        if (!b || !e) {
+          return sendJson(res, 200, { ok: false, error: '识别已完成，但这篇作文或所在批次已被删除，结果未能保存。' });
+        }
+        const out = applyIdentityScan(e, r.merged, r.read, !!body.force);
+        e.studentId = (e.identity && e.identity.name) ? await resolveStudent(b, e.identity) : '';
+        await writeJson(DB_FILE, db);
+        return sendJson(res, 200, {
+          ok: true, essay: e, candidates: out.candidates, scan: out.scan,
+          hadShot: r.hadShot
+        });
+      });
+    } catch (err) {
+      return sendJson(res, 200, { ok: false, error: String(err.message || err) });
+    }
+  }
+
+  /* ---- 班级名单：读 / 存 ----
+     GET  /api/class/list?className=九二班 → 返回该班名单与原文
+     POST /api/class/list { className, text } → 覆盖保存（换行分隔，一行一人） */
+  if (pathname === '/api/class/list') {
+    const store = await loadRosters();
+    if (req.method === 'GET') {
+      const className = String(query.get('className') || '').trim();
+      const cls = rosterOf(store, className);
+      return sendJson(res, 200, {
+        ok: true,
+        className: cls ? cls.className : className,
+        students: cls ? cls.students : [],
+        classes: store.classes.map(function (c) {
+          return { className: c.className, count: c.students.length, updatedAt: c.updatedAt || '' };
+        })
+      });
+    }
+    const className = String(body.className || '').trim();
+    if (!className) return sendJson(res, 200, { ok: false, error: '请先填写班级名称' });
+    return await withData(async function () {
+      const store = await loadRosters();
+      const students = parseRosterText(body.text);
+      const key = classKey(className);
+      const rest = store.classes.filter(function (c) { return classKey(c.className) !== key; });
+      if (students.length) {
+        rest.push({ className: className, students: students, updatedAt: new Date().toISOString() });
+      }
+      const next = { classes: rest };
+      await writeJson(ROSTERS_FILE, next);
+      return sendJson(res, 200, { ok: true, className: className, students: students, saved: students.length });
+    });
   }
 
   /* ---- 学生档案总览 ---- */
@@ -2192,7 +2912,7 @@ async function handleApi(req, res, pathname, query) {
           errors: (e.ai && e.ai.errors) || [],
           plagiarism: (e.ai && e.ai.plagiarism) || null,
           transcription: (r && r.transcription) || '',
-          modelEssay: (e.modelEssayRes && e.modelEssayRes.text) || (r && r.modelEssay) || '',
+          modelEssay: effectiveModelEssay(e),
           dimensions: (r && r.dimensions) || {}
         });
       });
@@ -2225,39 +2945,41 @@ async function handleApi(req, res, pathname, query) {
 
   /* ---- 修改学生档案（姓名/班级/学号），并同步到所有关联作文 ---- */
   if (pathname === '/api/student/update') {
-    const store = await loadStudents();
-    const s = store.students.find(function (x) { return x.id === body.id; });
-    if (!s) return sendJson(res, 404, { ok: false, error: '学生档案不存在' });
+    return await withData(async function () {
+      const store = await loadStudents();
+      const s = store.students.find(function (x) { return x.id === body.id; });
+      if (!s) return sendJson(res, 404, { ok: false, error: '学生档案不存在' });
 
-    const src = body.student || {};
-    const name = String(src.name === undefined ? s.name : src.name).trim();
-    const className = String(src.className === undefined ? s.className : src.className).trim();
-    const seatNo = String(src.seatNo === undefined ? s.seatNo : src.seatNo).trim();
-    if (!name) return sendJson(res, 200, { ok: false, error: '姓名不能为空（没有姓名就无法归档）' });
+      const src = body.student || {};
+      const name = String(src.name === undefined ? s.name : src.name).trim();
+      const className = String(src.className === undefined ? s.className : src.className).trim();
+      const seatNo = String(src.seatNo === undefined ? s.seatNo : src.seatNo).trim();
+      if (!name) return sendJson(res, 200, { ok: false, error: '姓名不能为空（没有姓名就无法归档）' });
 
-    s.name = name;
-    s.className = className;
-    s.seatNo = seatNo;
+      s.name = name;
+      s.className = className;
+      s.seatNo = seatNo;
 
-    // 同步写回所有关联作文，然后整体重建索引（处理改名/改班导致的归并）
-    const db = await loadDb();
-    let touched = 0;
-    db.batches.forEach(function (b) {
-      b.essays.forEach(function (e) {
-        if (e.studentId !== s.id) return;
-        e.identity = Object.assign({}, e.identity, {
-          name: name, className: className, seatNo: seatNo,
-          // 教师改过档案就把这篇锁定为「教师填写」，之后重新批改不会再把信息改回去
-          source: 'manual',
-          updatedAt: new Date().toISOString()
+      // 同步写回所有关联作文，然后整体重建索引（处理改名/改班导致的归并）
+      const db = await loadDb();
+      let touched = 0;
+      db.batches.forEach(function (b) {
+        b.essays.forEach(function (e) {
+          if (e.studentId !== s.id) return;
+          e.identity = Object.assign({}, e.identity, {
+            name: name, className: className, seatNo: seatNo,
+            // 教师改过档案就把这篇锁定为「教师填写」，之后重新批改不会再把信息改回去
+            source: 'manual',
+            updatedAt: new Date().toISOString()
+          });
+          touched++;
         });
-        touched++;
       });
+      await writeJson(DB_FILE, db);
+      await writeJson(STUDENTS_FILE, store);
+      const rebuilt = await rebuildStudents();
+      return sendJson(res, 200, { ok: true, updated: touched, rebuilt: rebuilt });
     });
-    await writeJson(DB_FILE, db);
-    await writeJson(STUDENTS_FILE, store);
-    const rebuilt = await rebuildStudents();
-    return sendJson(res, 200, { ok: true, updated: touched, rebuilt: rebuilt });
   }
 
   /* ---- 导出跨批次成绩矩阵（学生 × 各次作文） ---- */
@@ -2369,7 +3091,15 @@ async function handleApi(req, res, pathname, query) {
     if (!list.length) return sendJson(res, 200, { ok: false, error: '没有可导出的作文（可能都还没有批改结果）' });
 
     const essayMap = {};
-    list.forEach((e) => { essayMap[e.id] = e.modelEssayRes || null; });
+    list.forEach(function (e) {
+      // 范文统一走 effectiveModelEssay 的口径：教师复核改过的 > 单独生成的 > 批改附带的
+      const text = effectiveModelEssay(e);
+      essayMap[e.id] = text ? {
+        text: text,
+        notes: (e.modelEssayRes && e.modelEssayRes.notes) || [],
+        keyPhrases: (e.modelEssayRes && e.modelEssayRes.keyPhrases) || []
+      } : null;
+    });
 
     const buf = buildReportDocx(b, list, essayMap);
     const base = (b.title || '作文批改') + '_' + (b.className || '未填班级') + '_学生报告';
@@ -2384,13 +3114,17 @@ async function handleApi(req, res, pathname, query) {
 
   /* ---- 重置单篇（重新批改） ---- */
   if (pathname === '/api/essay/reset') {
-    const db = await loadDb();
-    const b = findBatch(db, body.batchId);
-    if (!b) return sendJson(res, 404, { ok: false, error: '批次不存在' });
-    const e = b.essays.find((x) => x.id === body.essayId);
-    if (e) { e.status = 'pending'; e.aiError = ''; e.aiRaw = ''; }
-    await writeJson(DB_FILE, db);
-    return sendJson(res, 200, { ok: true });
+    return await withData(async function () {
+      const db = await loadDb();
+      const b = findBatch(db, body.batchId);
+      if (!b) return sendJson(res, 404, { ok: false, error: '批次不存在' });
+      const e = b.essays.find((x) => x.id === body.essayId);
+      // 旧结果一并清掉：不然重置后登分表还显示旧分、状态却是「未批改」，自相矛盾。
+      // reset 只用于重批失败 / 空结果的篇目，清掉的本来就不是有效成绩。
+      if (e) { e.status = 'pending'; e.ai = null; e.aiError = ''; e.aiRaw = ''; }
+      await writeJson(DB_FILE, db);
+      return sendJson(res, 200, { ok: true });
+    });
   }
 
   /* ---- 导出 CSV ---- */
@@ -2450,6 +3184,14 @@ function openBrowser(url) {
 }
 
 const server = http.createServer(async (req, res) => {
+  // 只认指向本机服务的 Host 头，挡掉 DNS rebinding：外部网页把自己的域名解析到
+  // 127.0.0.1 后冒充同源来读本地学生数据。正常访问（127.0.0.1 / localhost + 端口）不受影响。
+  const host = String(req.headers.host || '').toLowerCase();
+  if (host !== HOST + ':' + PORT && host !== 'localhost:' + PORT) {
+    res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('forbidden');
+    return;
+  }
   const u = new URL(req.url, 'http://' + HOST + ':' + PORT);
   try {
     if (u.pathname.startsWith('/api/')) {
@@ -2512,7 +3254,8 @@ init().then(start).catch((e) => {
     console.error('    处理：');
     console.error('      1. 先把损坏的文件改名留档（例如 db.json → db.broken.json）');
     console.error('      2. 到 data/backup/ 里挑一份对应的快照（损坏的是 db.json 就找 db-*.json，');
-    console.error('         是 students.json 就找 students-*.json；文件名排序最靠后的那份最新），复制成同名文件');
+    console.error('         是 students.json 就找 students-*.json，是 rosters.json 就找 rosters-*.json；');
+    console.error('         文件名排序最靠后的那份最新），复制成同名文件');
     console.error('      3. 重新启动。若这是第一次使用、本来就没有数据，直接删掉损坏文件即可。');
     console.error('');
   } else if (e instanceof SyntaxError) {
